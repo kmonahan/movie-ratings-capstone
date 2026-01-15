@@ -6,7 +6,8 @@ load("rdas/edx.RData")
 
 # Keep only users who have rated at least 100 movies, so we have data to 
 # draw on.
-edx_filtered <- as.data.table(edx)[, if (.N >= 100) .SD, by = userId]
+# edx_filtered <- as.data.table(edx)[, if (.N >= 100) .SD, by = userId]
+edx_filtered <-  as.data.table(edx)
 
 # Create our test and training sets by assigning 20% of the ratings made by
 # each user to our test set
