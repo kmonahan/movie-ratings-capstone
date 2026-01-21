@@ -8,12 +8,14 @@ load("rdas/test_set_clean.RData")
 
 # UTILITY FUNCTIONS
 # Clamp function to enforce constraint that ratings are between 0.5 and 5
-# From https://rafalab.dfci.harvard.edu/dsbook-part-2/highdim/regularization.html#user-effects 
-clamp <- function(x, lower = 0.5, upper = 5) pmax(pmin(x, upper), lower)
+# From https://rafalab.dfci.harvard.edu/dsbook-part-2/highdim/regularization.html#user-effects
+clamp <- function(x, lower = 0.5, upper = 5)
+  pmax(pmin(x, upper), lower)
 
 # Calculate RMSE from residuals
 # From https://rafalab.dfci.harvard.edu/dsbook-part-2/highdim/regularization.html#sec-netflix-loss-function
-rmse <- function(r) sqrt(mean(r^2))
+rmse <- function(r)
+  sqrt(mean(r^2))
 
 # BASELINE
 
@@ -24,164 +26,88 @@ mu <- mean(train_set$rating, na.rm = TRUE)
 # improves accuracy.
 baseline <- rmse(test_set$rating - mu)
 
-# USER AND MOVIE EFFECTS
-# fit_als function taken from https://rafalab.dfci.harvard.edu/dsbook-part-2/highdim/regularization.html#penalized-least-squares
-fit_als <- function(data = train_set, lambda = 0.0001, tol = 1e-6, max_iter = 100) {
-  # Convert to data table so we can use the `:=` functional form
-  fit <- as.data.table(copy(data))
-  N <- nrow(fit)
-  mu <- mean(fit$rating)
-  # Adds columns a and b to the fit table. Initial value for all rows is 0.
-  fit[, `:=`(a = 0, b = 0)]
-  
-  for (iter in 1:max_iter) {
-    # Stash a copy of the existing a and b columns, so we can compare them later
-    prev_a <- copy(fit$a)
-    prev_b <- copy(fit$b)
-    
-    fit[, a := sum(rating - mu - b)/(.N + N*lambda), by = userId]
-    fit[, b := sum(rating - mu - a)/(.N + N*lambda), by = movieId]
-    
-    # Calculate the amount of the update
-    delta <- max(c(abs(fit$a - prev_a), abs(fit$b - prev_b)))
-    # If the update is less than what we set as our tolerance, we're done!
-    # Otherwise, it'll keep going until we hit max_iter iterations.
-    if (delta < tol) break
-  }
-  # Return the regularized effects
-  return(with(fit, list(mu = mu, b_u = setNames(a, userId), b_i = setNames(b, movieId))))
-}
-
-# Find the best lambda
-# From the first run, lambda is 0.040404040
-# Commenting this out so we don't keep running the code.
-# lambdas <- seq(0, 1, length.out = 100)
-# rmses <- sapply(lambdas, function(l) { 
-#   fit <- fit_als(lambda = l, tol = 1e-3)
-#   resid <- with(test_set, rating - clamp(fit$mu + fit$b_u[userId] + fit$b_i[movieId]))
-#   rmse(resid)
-# })
-
-# Now that we know the general area, try a much smaller range
-# lambdas <- seq(0.03, 0.05, length.out = 100)
-# rmses <- sapply(lambdas, function(l) { 
-#   fit <- fit_als(lambda = l, tol = 1e-3)
-#   resid <- with(test_set, rating - clamp(fit$mu + fit$b_u[userId] + fit$b_i[movieId]))
-#   rmse(resid)
-# })
-# 
-# plot(lambdas, rmses, type = "l", xlab = expression(lambda), ylab = "RMSE")
-# 
-# lambda <- lambdas[which.min(rmses)]
-# Commenting out the code and hard-coding the result so we don't keep running
-# a very slow loop
-lambda <- 0.04454545454545454545
-
-fit <- fit_als(train_set, lambda)
-mu <- fit$mu
-b_u <- fit$b_u
-b_i <- fit$b_i
-
-resid <- with(test_set, rating - clamp(mu + b_i[movieId] + b_u[userId]))
-with_both_effect <- rmse(resid)
-
-fit <- as.data.table(copy(train_set))
-N <- nrow(fit)
-movie_features <- fit[, .(
-  avg_rating = mean(rating),
-  genre = first(genres),
-  decade = first(decade),
-  n_ratings = .N
-), by = movieId]
-movie_features[, c := (sum(avg_rating - mu) * n_ratings) / (sum(n_ratings) + N * 0.1), by = genre]
-movie_features[, d := (sum(avg_rating - mu - c) * n_ratings) / (sum(n_ratings) + N * 0.1), by = decade]
-
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
-fit_als_all <- function(data = train_set, lambda_u = 0.001, lambda_m = 0.001, tol = 1e-6, max_iter = 100) {
+fit_als_all <- function(data = train_set,
+                        lambda_u = 5,
+                        lambda_m = 10,
+                        tol = 1e-6,
+                        max_iter = 100) {
   # Convert to data table so we can use the `:=` functional form
   fit <- as.data.table(copy(data))
   N <- nrow(fit)
   mu <- mean(fit$rating)
-
-  # Adds columns a and b to the fit table. Initial value for all rows is 0.
-  fit[, `:=`(a = 0, b = 0)]
-    
-  # Genre and decade are attributes of a movie, so we calculate them by movie
-  # first, and then move on to ALS to compute individual user and movie effects.
-  # This is hopefully faster than trying to calculate them all in the loop.
-  movie_features <- fit[, .(
-    avg_rating = mean(rating),
-    genres = first(genres),
-    decade = first(decade),
-    n_ratings = .N
-  ), by = movieId]
-  movie_features[, c := (sum(avg_rating - mu) * n_ratings) / (sum(n_ratings) + N*lambda_m), by = genres]
-  movie_features[, d := (sum(avg_rating - mu - c) * n_ratings) / (sum(n_ratings) + N*lambda_m), by = decade]
-  fit <- merge(fit, movie_features[, .(movieId, c, d)], by = "movieId")
   
+  # Index by user and movie.
+  # Add genre and decade to the movie index, because they are attributes of the
+  # movie (vary per movie, not per user).
+  user_index <- fit[, .(a = 0), by = "userId"]
+  movie_index <- fit[, .(b = 0,
+                         genres = first(genres),
+                         decade = first(decade)), by = "movieId"]
+  
+  # Calculate genre effect
+  # First get just what we need: ratings per genre, number of genres, and the name of the genre(s)
+  genre_index <- fit[, .(resid = sum(rating - mu), n = .N), by = "genres"]
+  genre_index[, c := resid / (n + lambda_m)]
+  
+  # Create a temporary working data frame to use to calculate the decade effect
+  temp_fit <- merge(fit, genre_index[, .(genres, c)], by = "genres")
+  decade_index <- temp_fit[, .(resid = sum(rating - mu - c), n = .N), by = "decade"]
+  decade_index[, d := resid / (n + lambda_m)]
+  
+  # Now that we calculated the effects, add them to our movie_index
+  movie_index <- merge(movie_index, genre_index[, .(genres, c)], by = "genres")
+  movie_index <- merge(movie_index, decade_index[, .(decade, d)], by = "decade")
+  
+  # Now use ALS to calculate the movie and user effects
   for (iter in 1:max_iter) {
     # Stash a copy of the existing a and b columns, so we can compare them later
-    prev_a <- copy(fit$a)
-    prev_b <- copy(fit$b)
+    prev_a <- copy(user_index$a)
+    prev_b <- copy(movie_index$b)
     
-    # Estimate the user effect, given a movie and genre
-    fit[, a := sum(rating - mu - b - c - d)/(.N + N*lambda_u), by = userId]
-    # Now alternate and estimate the movie effect, given a user and genre
-    fit[, b := sum(rating - mu - a - c - d)/(.N + N*lambda_m), by = movieId]
+    # Create a temporary working data frame to hold our calculations by merging
+    # fit with our indexes
+    temp_fit <- merge(fit, user_index, by = "userId")
+    temp_fit <- merge(temp_fit, movie_index[, .(movieId, b, c, d)], by = "movieId")
     
-    # Calculate the amount of the update
-    delta <- max(c(abs(fit$a - prev_a), abs(fit$b - prev_b)))
+    # Estimate the user effect, given a movie, genre, and decade effect, and update
+    # our user index
+    user_index <- temp_fit[, .(a = sum(rating - mu - b - c - d) / (.N + lambda_u)), by = "userId"]
+    
+    # Recreate the temporary working data frame, now that we have an updated user effect
+    temp_fit <- merge(fit, user_index, by = "userId")
+    temp_fit <- merge(temp_fit, movie_index[, .(movieId, b, c, d)], by = "movieId")
+    
+    # Now estimate the movie effect, given a user, genre, and decade effect,
+    # and update our movie index
+    fit_movies <- temp_fit[, .(b = sum(rating - mu - a - c - d) / (.N + lambda_m)), by = "movieId"]
+    movie_index <- merge(movie_index[, .(movieId, genres, decade, c, d)], fit_movies, by = "movieId")
+    
+    
+    # Check for convergence
+    delta <- max(c(abs(user_index$a - prev_a), abs(movie_index$b - prev_b)))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
-    if (delta < tol) break
+    if (delta < tol)
+      break
   }
   # Return the regularized effects
-  return(with(fit, list(mu = mu, b_u = setNames(a, userId), b_i = setNames(b, movieId), b_g = setNames(c, genres), b_d = setNames(d, decade))))
+  list(
+    mu = mu,
+    b_u = setNames(user_index$a, user_index$userId),
+    b_i = setNames(movie_index$b, movie_index$movieId),
+    b_g = setNames(genre_index$c, genre_index$genres),
+    b_d = setNames(decade_index$d, decade_index$decade)
+  )
 }
 
-# lambdas <- 10^-seq(3:6)
-# grid_params <- crossing(lambda_a = lambdas, lambda_b = lambdas, lambda_c = lambdas, lambda_d = lambdas)
-# 
-# n_cores <- detectCores()
-# cluster <- makeCluster(n_cores - 1)
-# registerDoParallel(cluster)
-# trials <- nrow(grid_params)
-# # TODO: Use proper cross-validation here
-# tuning_results <- foreach(i=1:nrow(grid_params), .combine=cbind, .packages = "data.table") %dopar% {
-#   row <- grid_params[i,]
-#   fit <- fit_als_all(test_set, lambda_a=row['lambda_a'], lambda_b=row['lambda_b'], lambda_c=row['lambda_c'], lambda_d=row['lambda_d'], tol = 1e-3, max_iter = 50)
-#   mu <- fit$mu
-#   b_u <- fit$b_u
-#   b_i <- fit$b_i
-#   b_g <- fit$b_g
-#   b_d <- fit$b_d
-#   resid <- with(test_set, rating - clamp(mu + b_i[movieId] + b_u[userId] + b_g[genres] + b_d[decade]))
-#   rmse(resid)
-# }
-# stopCluster(cl=cluster)
-
-n_cores <- detectCores()
-cluster <- makeCluster(n_cores / 2)
-registerDoParallel(cluster)
-lambdas <- seq(0, 1, length.out = 10)
-tuning_params <- crossing(lambda_u=lambdas, lambda_m=lambdas)
-rmses <- foreach(i=1:nrow(tuning_params), .packages = "data.table") %dopar% {
- l <- tuning_params[i, ]
- fit <- fit_als_all(lambda_u = l['lambda_u'], lambda_m = l['lambda_m'], tol = 1e-3)
- resid <- with(test_set, rating - clamp(mu + b_i[movieId] + b_u[userId] + b_g[genres] + b_d[decade]))
- rmse(resid)
-}
-stopCluster(cl=cluster)
-min(as.numeric(rmses))
-max(as.numeric(rmses))
-
-fit <- fit_als_all(train_set, lambda = lambda)
+fit <- fit_als_all(train_set)
 mu <- fit$mu
 b_u <- fit$b_u
 b_i <- fit$b_i
 b_g <- fit$b_g
 b_d <- fit$b_d
 
-resid <- with(test_set, rating - clamp(mu + b_i[movieId] + b_u[userId] + b_g[genres] + b_d[decade]))
+resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
 with_all_effects <- rmse(resid)
