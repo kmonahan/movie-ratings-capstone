@@ -115,20 +115,7 @@ b_d <- fit$b_d
 resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
 with_all_effects <- rmse(resid)
 
-fit <- as.data.table(copy(train_set))
-user_index <- fit[, .(a = 0), by = "userId"]
-user_index$userId <- as.character(user_index$userId)
-movie_index <- fit[, .(b = 0,
-                       genres = first(genres),
-                       decade = first(decade)), by = "movieId"]
-movie_index$movieId <- as.character(movie_index$movieId)
-K <- 5
-p <- svd(matrix(rnorm(K * nrow(user_index), 0, 0.1), nrow(user_index), K))$u
-rownames(p) <- user_index$userId
-q <- matrix(rep(0, K * nrow(movie_index)), nrow(movie_index), K)
-rownames(q) <- movie_index$movieId
-pq <- rep(0, nrow(fit))
-pq <- rowSums(p[as.character(fit$userId), -1, drop = FALSE] * q[as.character(fit$movieId), -1, drop = FALSE])
+
 
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
@@ -148,7 +135,6 @@ fit_als_with_latent <- function(data = train_set,
   # Add genre and decade to the movie index, because they are attributes of the
   # movie (vary per movie, not per user).
   user_index <- fit[, .(a = 0), by = "userId"]
-  user_index$userId <- as.character(user_index$userId)
   movie_index <- fit[, .(b = 0,
                          genres = first(genres),
                          decade = first(decade)), by = "movieId"]
@@ -168,7 +154,6 @@ fit_als_with_latent <- function(data = train_set,
   # Now that we calculated the effects, add them to our movie_index
   movie_index <- merge(movie_index, genre_index[, .(genres, c)], by = "genres")
   movie_index <- merge(movie_index, decade_index[, .(decade, d)], by = "decade")
-  movie_index$movieId <- as.character(movie_index$movieId)
   
   # Next use singular value decomposition to find the latent user effects
   # Adapted from the source code for fit_recommender_model in dslabs
@@ -178,6 +163,7 @@ fit_als_with_latent <- function(data = train_set,
   q <- matrix(rep(0, K * nrow(movie_index)), nrow(movie_index), K)
   rownames(q) <- movie_index$movieId
   pq <- rep(0, nrow(fit))
+  prev_obj <- 0
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
@@ -206,35 +192,80 @@ fit_als_with_latent <- function(data = train_set,
     fit_movies <- fit_movies |> mutate(b = replace_na(b, -1))
     movie_index <- merge(movie_index[, .(movieId, genres, decade, c, d)], fit_movies, by = "movieId")
     
-    # Now calculate pq
+    # Now calculate the initial pq
     pq <- rowSums(p[as.character(fit$userId), -1, drop = FALSE] * q[as.character(fit$movieId), -1, drop = FALSE])
-    resid <- rating - mu - user_index$a - movie_index$b - movie_index$c - movie_index$d - pq
+    
+    temp_fit <- merge(fit, user_index, by="userId")
+    temp_fit <- merge(temp_fit, movie_index[, .(movieId, b)], by = "movieId")
+    resid <- temp_fit$rating - mu - temp_fit$a - temp_fit$b - temp_fit$c - temp_fit$d - pq
+    
+    # For K latent factors, calculate the effect using ALS again
+    for (k in 1:K) {
+      q[as.character(movie_index$movieId), k] <- sapply(movie_index$movieId, function(i) { 
+        x <- p[as.character(fit$userId)[i], k]
+        sum(x*resid[i])/(sum(x^2))
+      })
+      p[,k] <- sapply(user_index$userId, function(i) {
+        x <- q[as.character(fit$movieId)[i], k]
+        sum(x*resid[i])/(sum(x^2))
+      })
+      resid <- resid - p[as.character(fit$userId), k]*q[as.character(fit$movieId), k]
+    }
+    
+    # Update pq now that we've calculated the effects
+    pq <- rowSums(p[as.character(fit$userId), ] * q[as.character(fit$movieId), ])
+    # Update our residuals
+    resid <- temp_fit$rating - mu - temp_fit$a - temp_fit$b - temp_fit$c - temp_fit$d - pq
     
     # Check for convergence
     delta <- max(c(abs(user_index$a - prev_a), abs(movie_index$b - prev_b)))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
+    
+    # TODO: Use other values when calculating delta
     if (delta < tol)
       break
+    message(sprintf("Iteration %d: Delta = %.6f", 
+                    iter, delta))
   }
+  
+  # TODO: Figure this out!
+  ## orthogonalize factors via SVD of p %*% t(q[index_q,]) and rescale by sqrt(s$d)
+  # Error in qr.default(p) : NA/NaN/Inf in foreign function call (arg 1)
+  # Called from: qr.default(p)
+  QR_p <- qr(p)
+  QR_q <- qr(q[as.character(movie_index$movieId),,drop = FALSE])
+  s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
+  u <- qr.Q(QR_p) %*% s$u
+  v <- qr.Q(QR_q) %*% s$v
+  
+  rownames(u) <- rownames(p)
+  rownames(v) <- rownames(q[as.character(movie_index$movieId),,drop = FALSE])
+  p <- sweep(u, 2, sqrt(s$d), FUN = "*")
+  q[as.character(movie_index$movieId),] <- sweep(v, 2, sqrt(s$d), FUN = "*")
+  
   # Return the regularized effects
   list(
     mu = mu,
     b_u = setNames(user_index$a, user_index$userId),
     b_i = setNames(movie_index$b, movie_index$movieId),
     b_g = setNames(genre_index$c, genre_index$genres),
-    b_d = setNames(decade_index$d, decade_index$decade)
+    b_d = setNames(decade_index$d, decade_index$decade),
+    p = p,
+    q = q
   )
 }
 
 # TODO: Tune and select lambdas
 # TODO: Try with a more realistic K
-fit <- fit_als_with_latent(train_set)
+fit <- fit_als_with_latent(train_set, max_iter = 50, tol = 1e-3)
 mu <- fit$mu
 b_u <- fit$b_u
 b_i <- fit$b_i
 b_g <- fit$b_g
 b_d <- fit$b_d
 
-resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
+pq <- rowSums(fit$p[as.character(test_set$userId), ] * q[as.character(test_set$movieId), ])
+
+resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade) + pq]))
 with_latent <- rmse(resid)
