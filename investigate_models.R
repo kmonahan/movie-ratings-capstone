@@ -179,8 +179,6 @@ fit_als_with_latent <- function(data = train_set,
     # Estimate the user effect, given a movie, genre, and decade effect, and update
     # our user index
     user_index <- temp_fit[, .(a = sum(rating - mu - b - c - d, na.rm = FALSE) / (.N + lambda_u)), by = "userId"]
-    # TODO: This isn't impacting accuracy. Do we need to account for unrated movies earlier?
-    user_index <- user_index |> mutate(a = replace_na(a, -1))
     
     # Recreate the temporary working data frame, now that we have an updated user effect
     temp_fit <- merge(fit, user_index, by = "userId")
@@ -189,33 +187,33 @@ fit_als_with_latent <- function(data = train_set,
     # Now estimate the movie effect, given a user, genre, and decade effect,
     # and update our movie index
     fit_movies <- temp_fit[, .(b = sum(rating - mu - a - c - d, na.rm = FALSE) / (.N + lambda_m)), by = "movieId"]
-    fit_movies <- fit_movies |> mutate(b = replace_na(b, -1))
     movie_index <- merge(movie_index[, .(movieId, genres, decade, c, d)], fit_movies, by = "movieId")
     
     # Now calculate the initial pq
-    pq <- rowSums(p[as.character(fit$userId), -1, drop = FALSE] * q[as.character(fit$movieId), -1, drop = FALSE])
+    pq <- rowSums(p[as.character(user_index$userId), -1, drop = FALSE] * q[as.character(movie_index$movieId), -1, drop = FALSE])
     
-    temp_fit <- merge(fit, user_index, by="userId")
-    temp_fit <- merge(temp_fit, movie_index[, .(movieId, b)], by = "movieId")
-    resid <- temp_fit$rating - mu - temp_fit$a - temp_fit$b - temp_fit$c - temp_fit$d - pq
+    message(sprintf("Resid %d: Length %d; NAs %d", iter, length(resid), sum(is.na(resid))))
     
     # For K latent factors, calculate the effect using ALS again
     for (k in 1:K) {
       q[as.character(movie_index$movieId), k] <- sapply(movie_index$movieId, function(i) { 
-        x <- p[as.character(fit$userId)[i], k]
+        x <- replace_na(p[as.character(fit$userId)[i], k], -1)
         sum(x*resid[i])/(sum(x^2))
       })
-      p[,k] <- sapply(user_index$userId, function(i) {
-        x <- q[as.character(fit$movieId)[i], k]
+      p[as.character(user_index$userId), k] <- sapply(user_index$userId, function(i) {
+        x <- replace_na(q[as.character(fit$movieId)[i], k], -1)
         sum(x*resid[i])/(sum(x^2))
       })
       resid <- resid - p[as.character(fit$userId), k]*q[as.character(fit$movieId), k]
+      message(sprintf("k iter %d, p NAs %d, p not NAs %d", k, sum(is.na(p)), sum(!is.na(p))))
+      if (sum(is.na(p)) > 0) break
     }
-    
+    message(sprintf("NAs: p %d, q %d, pq %d", sum(is.na(p)), sum(is.na(q)), sum(is.na(pq))))
     # Update pq now that we've calculated the effects
     pq <- rowSums(p[as.character(fit$userId), ] * q[as.character(fit$movieId), ])
     # Update our residuals
-    resid <- temp_fit$rating - mu - temp_fit$a - temp_fit$b - temp_fit$c - temp_fit$d - pq
+    temp_fit$pq <- pq
+    resid <- temp_fit |> mutate(resid = sum(rating - mu - a - b - c - d - pq)) |> pull(resid)
     
     # Check for convergence
     delta <- max(c(abs(user_index$a - prev_a), abs(movie_index$b - prev_b)))
@@ -223,42 +221,43 @@ fit_als_with_latent <- function(data = train_set,
     # Otherwise, it'll keep going until we hit max_iter iterations.
     
     # TODO: Use other values when calculating delta
-    if (delta < tol)
+    if (delta < tol | sum(is.na(p)) > 0)
       break
     message(sprintf("Iteration %d: Delta = %.6f", 
                     iter, delta))
   }
+  list(p = p, q = q)
   
   # TODO: Figure this out!
   ## orthogonalize factors via SVD of p %*% t(q[index_q,]) and rescale by sqrt(s$d)
   # Error in qr.default(p) : NA/NaN/Inf in foreign function call (arg 1)
   # Called from: qr.default(p)
-  QR_p <- qr(p)
-  QR_q <- qr(q[as.character(movie_index$movieId),,drop = FALSE])
-  s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
-  u <- qr.Q(QR_p) %*% s$u
-  v <- qr.Q(QR_q) %*% s$v
-  
-  rownames(u) <- rownames(p)
-  rownames(v) <- rownames(q[as.character(movie_index$movieId),,drop = FALSE])
-  p <- sweep(u, 2, sqrt(s$d), FUN = "*")
-  q[as.character(movie_index$movieId),] <- sweep(v, 2, sqrt(s$d), FUN = "*")
-  
+  # QR_p <- qr(p)
+  # QR_q <- qr(q[as.character(movie_index$movieId),,drop = FALSE])
+  # s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
+  # u <- qr.Q(QR_p) %*% s$u
+  # v <- qr.Q(QR_q) %*% s$v
+
+  # rownames(u) <- rownames(p)
+  # rownames(v) <- rownames(q[as.character(movie_index$movieId),,drop = FALSE])
+  # p <- sweep(u, 2, sqrt(s$d), FUN = "*")
+  # q[as.character(movie_index$movieId),] <- sweep(v, 2, sqrt(s$d), FUN = "*")
+
   # Return the regularized effects
-  list(
-    mu = mu,
-    b_u = setNames(user_index$a, user_index$userId),
-    b_i = setNames(movie_index$b, movie_index$movieId),
-    b_g = setNames(genre_index$c, genre_index$genres),
-    b_d = setNames(decade_index$d, decade_index$decade),
-    p = p,
-    q = q
-  )
+  # list(
+  #  mu = mu,
+  #  b_u = setNames(user_index$a, user_index$userId),
+  #  b_i = setNames(movie_index$b, movie_index$movieId),
+  #  b_g = setNames(genre_index$c, genre_index$genres),
+  #  b_d = setNames(decade_index$d, decade_index$decade),
+  #  p = p,
+  #  q = q
+  # )
 }
 
 # TODO: Tune and select lambdas
 # TODO: Try with a more realistic K
-fit <- fit_als_with_latent(train_set, max_iter = 50, tol = 1e-3)
+fit <- fit_als_with_latent(train_set, max_iter = 5, tol = 1e-3)
 mu <- fit$mu
 b_u <- fit$b_u
 b_i <- fit$b_i
