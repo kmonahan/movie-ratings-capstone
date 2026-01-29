@@ -119,7 +119,7 @@ with_all_effects <- rmse(resid)
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
-                        K = 2,        
+                        K = 5,        
                         lambda_u = 300,
                         lambda_m = 300,
                         lambda_pq = 700,
@@ -178,14 +178,10 @@ fit_als_with_latent <- function(data = train_set,
   q <- matrix(rep(0, K * J), J, K)
   rownames(q) <- unique_movies
   pq <- rep(0, N)
-  prev_obj <- 0
+  prev_mse <- 0
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
-    # Stash a copy of the existing a and b columns, so we can compare them later
-    prev_a <- copy(fit$a)
-    prev_b <- copy(fit$b)
-    
     # Estimate the user effect, given a movie, genre, and decade effect, and update
     # our user index
     fit_users <- fit |> 
@@ -210,7 +206,6 @@ fit_als_with_latent <- function(data = train_set,
     
     # For K latent factors, calculate the effect using ALS again
     for (k in 1:K) {
-      message(sprintf("Beginning k %d", k))
       q[min_ratings_index, k] <- sapply(movie_index_min, function(i) {
         x <- p[user_ids[i], k]
         sum(x*resid[i])/(sum(x^2) + lambda_pq)
@@ -230,21 +225,20 @@ fit_als_with_latent <- function(data = train_set,
     resid <- with(fit, rating - (mu + a + b + c + d + pq))
     
     # Check for convergence
-    delta <- max(c(abs(fit$a - prev_a), abs(fit$b - prev_b)))
-    # If the update is less than what we set as our tolerance, we're done!
-    # Otherwise, it'll keep going until we hit max_iter iterations.
-    
-    # TODO: Use other values when calculating delta
-    if (delta < tol | sum(is.na(p)) > 0)
-      break
+    # TODO: Should the lambdas be in here?
+    mse <- mean(resid^2)
+    delta <- abs((prev_mse - mse) / (prev_mse + tol))
     message(sprintf("Iteration %d: Delta = %.6f", 
                     iter, delta))
+    # If the update is less than what we set as our tolerance, we're done!
+    # Otherwise, it'll keep going until we hit max_iter iterations.
+    if (delta < tol)
+      break
+    prev_mse <- mse
   }
   
   # TODO: Figure this out!
   ## orthogonalize factors via SVD of p %*% t(q[index_q,]) and rescale by sqrt(s$d)
-  # Error in qr.default(p) : NA/NaN/Inf in foreign function call (arg 1)
-  # Called from: qr.default(p)
   QR_p <- qr(p)
   QR_q <- qr(q[min_ratings_index,,drop = FALSE])
   s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
@@ -276,7 +270,7 @@ fit_als_with_latent <- function(data = train_set,
 
 # TODO: Tune and select lambdas
 # TODO: Try with a more realistic K
-fit <- fit_als_with_latent(train_set, max_iter = 5, tol = 1e-3)
+fit <- fit_als_with_latent(train_set, max_iter = 50, tol = 1e-3)
 mu <- fit$mu
 b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
