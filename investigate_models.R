@@ -116,107 +116,123 @@ resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.
 with_all_effects <- rmse(resid)
 
 
-
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
                         K = 2,        
                         lambda_u = 5,
                         lambda_m = 10,
-                        lambda_pq = 0,
+                        lambda_pq = 5,
                         tol = 1e-6,
                         max_iter = 100) {
-  # Convert to data table so we can use the `:=` functional form
+  
+  # Copy the data so we can mutate it at will
   fit <- as.data.table(copy(data))
+  
+  # Calculate some initial numbers
   N <- nrow(fit)
   mu <- mean(fit$rating)
+
+  # Shorthand for easy reference
+  user_ids <- as.character(fit$userId)
+  movie_ids <- as.character(fit$movieId)
   
   # Index by user and movie.
-  # Add genre and decade to the movie index, because they are attributes of the
-  # movie (vary per movie, not per user).
-  user_index <- fit[, .(a = 0), by = "userId"]
-  movie_index <- fit[, .(b = 0,
-                         genres = first(genres),
-                         decade = first(decade)), by = "movieId"]
+  user_index <- split(1:N, user_ids)
+  movie_index <- split(1:N, movie_ids)
+  unique_users <- unique(user_ids)
+  unique_movies <- unique(movie_ids)
+  
+  n_item <- sapply(movie_index, length)
+  min_ratings_index <- which(n_item >= 20)
+  movie_index_min <- movie_index[min_ratings_index]
+  
+  movie_ids_by_length <- n_item[movie_ids]
+  min_data_index <- which(movie_ids_by_length >= 20)
+  user_index_min <- split(min_data_index, user_ids[min_data_index])
+  
+  # Set initial user and movie effects of 0
+  fit$a <- rep(0, N)
+  fit$b <- rep(0, N)
   
   # Calculate genre effect
   # First get just what we need: ratings per genre, number of genres, and the name of the genre(s)
-  genre_index <- fit[, .(resid = sum(rating - mu), n = .N), by = "genres"]
-  genre_index[, c := resid / (n + lambda_m)]
+  fit_genre <- fit |> group_by(genres) |> summarize(resid = sum(rating - mu), n = n(), genres = first(genres))
+  fit_genre <- fit_genre |> mutate(c = resid / (n + lambda_m)) |> select(genres, c)
+  fit <- left_join(fit, fit_genre, by = "genres")
+  rm(fit_genre)
   
-  # Create a temporary working data frame to use to calculate the decade effect
-  # TODO: Is creating the extra tables actually faster than modifying fit directly?
-  # TODO: Should I go back to using rm() to free up memory?
-  temp_fit <- merge(fit, genre_index[, .(genres, c)], by = "genres")
-  decade_index <- temp_fit[, .(resid = sum(rating - mu - c), n = .N), by = "decade"]
-  decade_index[, d := resid / (n + lambda_m)]
-  
-  # Now that we calculated the effects, add them to our movie_index
-  movie_index <- merge(movie_index, genre_index[, .(genres, c)], by = "genres")
-  movie_index <- merge(movie_index, decade_index[, .(decade, d)], by = "decade")
+  # Calculate decade effect
+  fit_decade <- fit |> group_by(decade) |> summarize(resid = sum(rating - mu - c), n = n(), decade = first(decade))
+  fit_decade <- fit_decade |> mutate(d = resid / (n + lambda_m)) |> select(decade, d)
+  fit <- left_join(fit, fit_decade, by = "decade")
+  rm(fit_decade)
   
   # Next use singular value decomposition to find the latent user effects
   # Adapted from the source code for fit_recommender_model in dslabs
   # https://cran.r-project.org/web/packages/dslabs/index.html
-  p <- svd(matrix(rnorm(K * nrow(user_index), 0, 0.1), nrow(user_index), K))$u
-  rownames(p) <- user_index$userId
-  q <- matrix(rep(0, K * nrow(movie_index)), nrow(movie_index), K)
-  rownames(q) <- movie_index$movieId
-  pq <- rep(0, nrow(fit))
+  I <- length(unique_users)
+  J <- length(unique_movies)
+  p <- svd(matrix(rnorm(K * I, 0, 0.1), I, K))$u
+  rownames(p) <- unique_users
+  q <- matrix(rep(0, K * J), J, K)
+  rownames(q) <- unique_movies
+  pq <- rep(0, N)
   prev_obj <- 0
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
     # Stash a copy of the existing a and b columns, so we can compare them later
-    prev_a <- copy(user_index$a)
-    prev_b <- copy(movie_index$b)
-    
-    # Create a temporary working data frame to hold our calculations by merging
-    # fit with our indexes
-    temp_fit <- merge(fit, user_index, by = "userId")
-    temp_fit <- merge(temp_fit, movie_index[, .(movieId, b, c, d)], by = "movieId")
+    prev_a <- copy(fit$a)
+    prev_b <- copy(fit$b)
     
     # Estimate the user effect, given a movie, genre, and decade effect, and update
     # our user index
-    user_index <- temp_fit[, .(a = sum(rating - mu - b - c - d, na.rm = FALSE) / (.N + lambda_u)), by = "userId"]
-    
-    # Recreate the temporary working data frame, now that we have an updated user effect
-    temp_fit <- merge(fit, user_index, by = "userId")
-    temp_fit <- merge(temp_fit, movie_index[, .(movieId, b, c, d)], by = "movieId")
+    fit_users <- fit |> 
+      group_by(userId) |> 
+      summarize(a = sum(rating - mu - b - c - d) / (n() + lambda_u), userId = first(userId)) |> 
+      select(userId, a)
+    fit <- rows_update(fit, fit_users, by = "userId")
+    rm(fit_users)
     
     # Now estimate the movie effect, given a user, genre, and decade effect,
     # and update our movie index
-    fit_movies <- temp_fit[, .(b = sum(rating - mu - a - c - d, na.rm = FALSE) / (.N + lambda_m)), by = "movieId"]
-    movie_index <- merge(movie_index[, .(movieId, genres, decade, c, d)], fit_movies, by = "movieId")
+    fit_movies <- fit |> 
+      group_by(movieId) |> 
+      summarize(b = sum(rating - mu - a - c - d) / (n() + lambda_m), movieId = first(movieId)) |> 
+      select(movieId, b)
+    fit <- rows_update(fit, fit_movies, by = "movieId")
+    rm(fit_movies)
     
     # Now calculate the initial pq
-    pq <- rowSums(p[as.character(user_index$userId), -1, drop = FALSE] * q[as.character(movie_index$movieId), -1, drop = FALSE])
-    
-    message(sprintf("Resid %d: Length %d; NAs %d", iter, length(resid), sum(is.na(resid))))
+    pq <- rowSums(p[user_ids, -1, drop = FALSE] * q[movie_ids, -1, drop = FALSE])
+    resid <- with(fit, rating - (mu + a + b + c + d + pq))
     
     # For K latent factors, calculate the effect using ALS again
     for (k in 1:K) {
-      q[as.character(movie_index$movieId), k] <- sapply(movie_index$movieId, function(i) { 
-        x <- replace_na(p[as.character(fit$userId)[i], k], -1)
-        sum(x*resid[i])/(sum(x^2))
+      message(sprintf("Beginning k %d", k))
+      q[min_ratings_index, k] <- sapply(movie_index_min, function(i) {
+        x <- p[user_ids[i], k]
+        sum(x*resid[i])/(sum(x^2) + lambda_pq)
       })
-      p[as.character(user_index$userId), k] <- sapply(user_index$userId, function(i) {
-        x <- replace_na(q[as.character(fit$movieId)[i], k], -1)
-        sum(x*resid[i])/(sum(x^2))
+      
+      p[, k] <- sapply(user_index_min, function(i) {
+        x <- q[movie_ids[i], k]
+        sum(x*resid[i])/(sum(x^2) + lambda_pq)
       })
-      resid <- resid - p[as.character(fit$userId), k]*q[as.character(fit$movieId), k]
+      
+      resid <- resid - p[user_ids, k]*q[movie_ids, k]
       message(sprintf("k iter %d, p NAs %d, p not NAs %d", k, sum(is.na(p)), sum(!is.na(p))))
-      if (sum(is.na(p)) > 0) break
     }
     message(sprintf("NAs: p %d, q %d, pq %d", sum(is.na(p)), sum(is.na(q)), sum(is.na(pq))))
     # Update pq now that we've calculated the effects
-    pq <- rowSums(p[as.character(fit$userId), ] * q[as.character(fit$movieId), ])
+    pq <- rowSums(p[user_ids, ] * q[movie_ids, ])
     # Update our residuals
-    temp_fit$pq <- pq
-    resid <- temp_fit |> mutate(resid = sum(rating - mu - a - b - c - d - pq)) |> pull(resid)
+    fit$pq <- pq
+    resid <- with(fit, rating - (mu + a + b + c + d + pq))
     
     # Check for convergence
-    delta <- max(c(abs(user_index$a - prev_a), abs(movie_index$b - prev_b)))
+    delta <- max(c(abs(fit$a - prev_a), abs(fit$b - prev_b)))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
     
