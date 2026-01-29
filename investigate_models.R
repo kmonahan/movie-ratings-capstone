@@ -120,9 +120,9 @@ with_all_effects <- rmse(resid)
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
                         K = 2,        
-                        lambda_u = 5,
-                        lambda_m = 10,
-                        lambda_pq = 5,
+                        lambda_u = 300,
+                        lambda_m = 300,
+                        lambda_pq = 700,
                         tol = 1e-6,
                         max_iter = 100) {
   
@@ -222,9 +222,7 @@ fit_als_with_latent <- function(data = train_set,
       })
       
       resid <- resid - p[user_ids, k]*q[movie_ids, k]
-      message(sprintf("k iter %d, p NAs %d, p not NAs %d", k, sum(is.na(p)), sum(!is.na(p))))
     }
-    message(sprintf("NAs: p %d, q %d, pq %d", sum(is.na(p)), sum(is.na(q)), sum(is.na(pq))))
     # Update pq now that we've calculated the effects
     pq <- rowSums(p[user_ids, ] * q[movie_ids, ])
     # Update our residuals
@@ -242,45 +240,50 @@ fit_als_with_latent <- function(data = train_set,
     message(sprintf("Iteration %d: Delta = %.6f", 
                     iter, delta))
   }
-  list(p = p, q = q)
   
   # TODO: Figure this out!
   ## orthogonalize factors via SVD of p %*% t(q[index_q,]) and rescale by sqrt(s$d)
   # Error in qr.default(p) : NA/NaN/Inf in foreign function call (arg 1)
   # Called from: qr.default(p)
-  # QR_p <- qr(p)
-  # QR_q <- qr(q[as.character(movie_index$movieId),,drop = FALSE])
-  # s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
-  # u <- qr.Q(QR_p) %*% s$u
-  # v <- qr.Q(QR_q) %*% s$v
+  QR_p <- qr(p)
+  QR_q <- qr(q[min_ratings_index,,drop = FALSE])
+  s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
+  u <- qr.Q(QR_p) %*% s$u
+  v <- qr.Q(QR_q) %*% s$v
 
-  # rownames(u) <- rownames(p)
-  # rownames(v) <- rownames(q[as.character(movie_index$movieId),,drop = FALSE])
-  # p <- sweep(u, 2, sqrt(s$d), FUN = "*")
-  # q[as.character(movie_index$movieId),] <- sweep(v, 2, sqrt(s$d), FUN = "*")
+  rownames(u) <- rownames(p)
+  rownames(v) <- rownames(q[min_ratings_index,,drop = FALSE])
+  p <- sweep(u, 2, sqrt(s$d), FUN = "*")
+  q[min_ratings_index,] <- sweep(v, 2, sqrt(s$d), FUN = "*")
+  
+  b_u <- fit |> group_by(userId) |> summarize(a = first(a))
+  b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
+  b_g <- fit |> group_by(genres) |> summarize(c = first(c))
+  b_d <- fit |> group_by(decade) |> summarize(d = first(d))
+  
 
   # Return the regularized effects
-  # list(
-  #  mu = mu,
-  #  b_u = setNames(user_index$a, user_index$userId),
-  #  b_i = setNames(movie_index$b, movie_index$movieId),
-  #  b_g = setNames(genre_index$c, genre_index$genres),
-  #  b_d = setNames(decade_index$d, decade_index$decade),
-  #  p = p,
-  #  q = q
-  # )
+  list(
+    mu = mu,
+    b_u = b_u,
+    b_i = b_i,
+    b_g = b_g,
+    b_d = b_d,
+    p = p,
+    q = q
+  )
 }
 
 # TODO: Tune and select lambdas
 # TODO: Try with a more realistic K
 fit <- fit_als_with_latent(train_set, max_iter = 5, tol = 1e-3)
 mu <- fit$mu
-b_u <- fit$b_u
-b_i <- fit$b_i
-b_g <- fit$b_g
-b_d <- fit$b_d
+b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+b_d <- setNames(fit$b_d$d, fit$b_d$decade)
 
-pq <- rowSums(fit$p[as.character(test_set$userId), ] * q[as.character(test_set$movieId), ])
-
-resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade) + pq]))
+pq <- rowSums(fit$p[as.character(test_set$userId), ] * fit$q[as.character(test_set$movieId), ])
+test_set$pq <- pq
+resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
 with_latent <- rmse(resid)
