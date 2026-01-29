@@ -237,18 +237,33 @@ fit_als_with_latent <- function(data = train_set,
     prev_mse <- mse
   }
   
-  # TODO: Figure this out!
-  ## orthogonalize factors via SVD of p %*% t(q[index_q,]) and rescale by sqrt(s$d)
+  # Create canonical form of orthogonal factors, ordered by importance
+  # "Orthogonal" = pointing in unrelated directions (at 90 degrees to one another)
+  # This helps prevent factors from being redundant and/or overlapping
+  
+  # Taken from the source code for fit_recommender_model in dslabs
+  # https://cran.r-project.org/web/packages/dslabs/index.html
+  
+  # Computes the QR decomposition of p
   QR_p <- qr(p)
+  # Computes the QR decomposition of q, including only movies with at least 20 ratings
   QR_q <- qr(q[min_ratings_index,,drop = FALSE])
+  # Computes the SVD of the product of the two R matrices
+  # That way, we're multiplying KxK matrices instead of the much larger NxN matrices
   s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
+  # Creates the new orthogonalized user factors
   u <- qr.Q(QR_p) %*% s$u
+  # Same but for movies
   v <- qr.Q(QR_q) %*% s$v
-
+  # Give our new factors the same rownames as the original p and q
   rownames(u) <- rownames(p)
   rownames(v) <- rownames(q[min_ratings_index,,drop = FALSE])
+  # Multiply all columns in u by the square root of s$d, which represents the importance/strength of the factor
+  # Using the square root keeps p and q on similar scales
   p <- sweep(u, 2, sqrt(s$d), FUN = "*")
+  # Same multiplication for q
   q[min_ratings_index,] <- sweep(v, 2, sqrt(s$d), FUN = "*")
+  # Now factors are ordered by importance -- the first column captures the most variance and so on
   
   b_u <- fit |> group_by(userId) |> summarize(a = first(a))
   b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
@@ -269,7 +284,6 @@ fit_als_with_latent <- function(data = train_set,
 }
 
 # TODO: Tune and select lambdas
-# TODO: Try with a more realistic K
 fit <- fit_als_with_latent(train_set, max_iter = 50, tol = 1e-3)
 mu <- fit$mu
 b_u <- setNames(fit$b_u$a, fit$b_u$userId)
