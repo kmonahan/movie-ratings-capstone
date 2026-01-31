@@ -120,9 +120,9 @@ with_all_effects <- rmse(resid)
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
                         K = 5,        
-                        lambda_u = 300,
-                        lambda_m = 300,
-                        lambda_pq = 700,
+                        lambda_u = 0.00005,
+                        lambda_m = 0.00005,
+                        lambda_pq = 0.0001,
                         tol = 1e-6,
                         max_iter = 100) {
   
@@ -158,13 +158,13 @@ fit_als_with_latent <- function(data = train_set,
   # Calculate genre effect
   # First get just what we need: ratings per genre, number of genres, and the name of the genre(s)
   fit_genre <- fit |> group_by(genres) |> summarize(resid = sum(rating - mu), n = n(), genres = first(genres))
-  fit_genre <- fit_genre |> mutate(c = resid / (n + lambda_m)) |> select(genres, c)
+  fit_genre <- fit_genre |> mutate(c = resid / (n + lambda_m * N)) |> select(genres, c)
   fit <- left_join(fit, fit_genre, by = "genres")
   rm(fit_genre)
   
   # Calculate decade effect
   fit_decade <- fit |> group_by(decade) |> summarize(resid = sum(rating - mu - c), n = n(), decade = first(decade))
-  fit_decade <- fit_decade |> mutate(d = resid / (n + lambda_m)) |> select(decade, d)
+  fit_decade <- fit_decade |> mutate(d = resid / (n + lambda_m * N)) |> select(decade, d)
   fit <- left_join(fit, fit_decade, by = "decade")
   rm(fit_decade)
   
@@ -178,7 +178,8 @@ fit_als_with_latent <- function(data = train_set,
   q <- matrix(rep(0, K * J), J, K)
   rownames(q) <- unique_movies
   pq <- rep(0, N)
-  prev_mse <- 0
+  resid <- with(fit, rating - (mu + a + b + c + d))
+  prev_loss <- mean(resid) + sum(fit$a^2) * lambda_u + sum(fit$b^2) * lambda_m + sum(fit$c^2) * lambda_m + sum(fit$d^2) * lambda_m
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
@@ -186,7 +187,7 @@ fit_als_with_latent <- function(data = train_set,
     # our user index
     fit_users <- fit |> 
       group_by(userId) |> 
-      summarize(a = sum(rating - mu - b - c - d) / (n() + lambda_u), userId = first(userId)) |> 
+      summarize(a = sum(rating - mu - b - c - d) / (n() + lambda_u * N), userId = first(userId)) |> 
       select(userId, a)
     fit <- rows_update(fit, fit_users, by = "userId")
     rm(fit_users)
@@ -195,7 +196,7 @@ fit_als_with_latent <- function(data = train_set,
     # and update our movie index
     fit_movies <- fit |> 
       group_by(movieId) |> 
-      summarize(b = sum(rating - mu - a - c - d) / (n() + lambda_m), movieId = first(movieId)) |> 
+      summarize(b = sum(rating - mu - a - c - d) / (n() + lambda_m * N), movieId = first(movieId)) |> 
       select(movieId, b)
     fit <- rows_update(fit, fit_movies, by = "movieId")
     rm(fit_movies)
@@ -208,12 +209,12 @@ fit_als_with_latent <- function(data = train_set,
     for (k in 1:K) {
       q[min_ratings_index, k] <- sapply(movie_index_min, function(i) {
         x <- p[user_ids[i], k]
-        sum(x*resid[i])/(sum(x^2) + lambda_pq)
+        sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
       
       p[, k] <- sapply(user_index_min, function(i) {
         x <- q[movie_ids[i], k]
-        sum(x*resid[i])/(sum(x^2) + lambda_pq)
+        sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
       
       resid <- resid - p[user_ids, k]*q[movie_ids, k]
@@ -224,17 +225,19 @@ fit_als_with_latent <- function(data = train_set,
     fit$pq <- pq
     resid <- with(fit, rating - (mu + a + b + c + d + pq))
     
-    # Check for convergence
-    # TODO: Should the lambdas be in here?
-    mse <- mean(resid^2)
-    delta <- abs((prev_mse - mse) / (prev_mse + tol))
+    # Check for convergence using Ridge regression/L2 regularization
+    # Loss function is modified to include the regularization term,
+    # so it's MSE + the sum of the co-efficient squared
+    loss <- mean(resid) + sum(fit$a^2) * lambda_u + sum(fit$b^2) * lambda_m + sum(fit$c^2) * lambda_m + sum(fit$d^2) * lambda_m + sum(fit$pq^2) * lambda_pq
+    # Delta is the percent of change between the previous and the last estimate
+    delta <- abs((prev_loss - loss) / prev_loss)
     message(sprintf("Iteration %d: Delta = %.6f", 
                     iter, delta))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
     if (delta < tol)
       break
-    prev_mse <- mse
+    prev_loss <- loss
   }
   
   # Create canonical form of orthogonal factors, ordered by importance
@@ -284,6 +287,8 @@ fit_als_with_latent <- function(data = train_set,
 }
 
 # TODO: Tune and select lambdas
+# TODO: Tune and select K
+# TODO: Decrease tolerance back to original value
 fit <- fit_als_with_latent(train_set, max_iter = 50, tol = 1e-3)
 mu <- fit$mu
 b_u <- setNames(fit$b_u$a, fit$b_u$userId)
