@@ -2,6 +2,7 @@ library(tidyverse)
 library(doParallel)
 library(foreach)
 library(data.table)
+library(caret)
 
 load("rdas/train_set_clean.RData")
 load("rdas/test_set_clean.RData")
@@ -122,7 +123,10 @@ fit_als_with_latent <- function(data = train_set,
                         K = 5,        
                         lambda_u = 0.00005,
                         lambda_m = 0.00005,
+                        lambda_g = 0.00005,
+                        lambda_d = 0.00005,
                         lambda_pq = 0.0001,
+                        min_ratings = 20,
                         tol = 1e-6,
                         max_iter = 100) {
   
@@ -144,11 +148,11 @@ fit_als_with_latent <- function(data = train_set,
   unique_movies <- unique(movie_ids)
   
   n_item <- sapply(movie_index, length)
-  min_ratings_index <- which(n_item >= 20)
+  min_ratings_index <- which(n_item >= min_ratings)
   movie_index_min <- movie_index[min_ratings_index]
   
   movie_ids_by_length <- n_item[movie_ids]
-  min_data_index <- which(movie_ids_by_length >= 20)
+  min_data_index <- which(movie_ids_by_length >= min_ratings)
   user_index_min <- split(min_data_index, user_ids[min_data_index])
   
   # Set initial user and movie effects of 0
@@ -158,13 +162,13 @@ fit_als_with_latent <- function(data = train_set,
   # Calculate genre effect
   # First get just what we need: ratings per genre, number of genres, and the name of the genre(s)
   fit_genre <- fit |> group_by(genres) |> summarize(resid = sum(rating - mu), n = n(), genres = first(genres))
-  fit_genre <- fit_genre |> mutate(c = resid / (n + lambda_m * N)) |> select(genres, c)
+  fit_genre <- fit_genre |> mutate(c = resid / (n + lambda_g * N)) |> select(genres, c)
   fit <- left_join(fit, fit_genre, by = "genres")
   rm(fit_genre)
   
   # Calculate decade effect
   fit_decade <- fit |> group_by(decade) |> summarize(resid = sum(rating - mu - c), n = n(), decade = first(decade))
-  fit_decade <- fit_decade |> mutate(d = resid / (n + lambda_m * N)) |> select(decade, d)
+  fit_decade <- fit_decade |> mutate(d = resid / (n + lambda_d * N)) |> select(decade, d)
   fit <- left_join(fit, fit_decade, by = "decade")
   rm(fit_decade)
   
@@ -179,7 +183,7 @@ fit_als_with_latent <- function(data = train_set,
   rownames(q) <- unique_movies
   pq <- rep(0, N)
   resid <- with(fit, rating - (mu + a + b + c + d))
-  prev_loss <- mean(resid) + sum(fit$a^2) * lambda_u + sum(fit$b^2) * lambda_m + sum(fit$c^2) * lambda_m + sum(fit$d^2) * lambda_m
+  prev_loss <- mean(resid) + sum(fit$a^2) * lambda_u + sum(fit$b^2) * lambda_m + sum(fit$c^2) * lambda_g + sum(fit$d^2) * lambda_d
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
@@ -228,7 +232,7 @@ fit_als_with_latent <- function(data = train_set,
     # Check for convergence using Ridge regression/L2 regularization
     # Loss function is modified to include the regularization term,
     # so it's MSE + the sum of the co-efficient squared
-    loss <- mean(resid) + sum(fit$a^2) * lambda_u + sum(fit$b^2) * lambda_m + sum(fit$c^2) * lambda_m + sum(fit$d^2) * lambda_m + sum(fit$pq^2) * lambda_pq
+    loss <- mean(resid) + sum(fit$a^2) * lambda_u + sum(fit$b^2) * lambda_m + sum(fit$c^2) * lambda_d + sum(fit$d^2) * lambda_m + sum(fit$pq^2) * lambda_pq
     # Delta is the percent of change between the previous and the last estimate
     delta <- abs((prev_loss - loss) / prev_loss)
     message(sprintf("Iteration %d: Delta = %.6f", 
@@ -285,6 +289,62 @@ fit_als_with_latent <- function(data = train_set,
     q = q
   )
 }
+
+# 5-fold cross-validation with bootstrap for tuning
+folds <- createResample(train_set$rating, times = 5, list = TRUE)
+sets <- lapply(folds, function(fold) {
+  train_set[-fold,]
+})
+lambdas <- 10^-(3:6)
+set <- sets$Resample1
+lambda <- lambdas[1]
+set_index <- split(1:nrow(set), set$userId)
+# Assign 10% of each user's rating to the test set
+test_index <- sapply(set_index, function(ind) sample(ind, ceiling(length(ind)*.1))) |>
+  unlist(use.names = TRUE) |> sort()
+mini_test_set <- set[test_index,]
+mini_train_set <- set[-test_index,]
+# Remove any movies that are not in BOTH the test and training sets
+mini_test_set <- mini_test_set |> 
+  semi_join(mini_train_set, by = "movieId")
+mini_train_set <- mini_train_set |> 
+  semi_join(mini_test_set, by = "movieId")
+
+fit <- fit_als_with_latent(mini_train_set, max_iter = 50, tol = 1e-4, lambda_m = lambda, min_ratings = 0)
+mu <- fit$mu
+b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+p <- fit$p
+pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
+mini_test_set$pq <- pq
+# TODO: Why are there a bunch of NAs in my resids?
+resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
+rmse(resid)
+cores <- min(detectCores() - 1, 10)
+registerDoParallel(cores)
+results <- foreach(lambda = lambdas) %do% {
+  validations <- foreach(set = sets, .packages = c("caret", "data.table", "tidyverse"), .verbose = TRUE) %dopar% {
+    test_index <- createDataPartition(set$rating, times = 1, p = 0.1, list = FALSE)
+    mini_train_set <- set[-test_index, ]
+    mini_test_set <- set[test_index, ]
+    fit <- fit_als_with_latent(mini_train_set, max_iter = 50, tol = 1e-4, lambda_m = lambda)
+    mu <- fit$mu
+    b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+    b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+    b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+    b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+    user_ids <- as.character(mini_test_set$userId)
+    p_user_ids <- rownames(p)
+    pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
+    mini_test_set$pq <- pq
+    resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
+    rmse(resid)
+  }
+  mean(validations)
+}
+stopImplicitCluster()
 
 # TODO: Tune and select lambdas
 # TODO: Tune and select K
