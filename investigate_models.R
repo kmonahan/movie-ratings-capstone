@@ -291,16 +291,16 @@ fit_als_with_latent <- function(data = train_set,
 }
 
 # 5-fold cross-validation with bootstrap for tuning
-folds <- createResample(train_set$rating, times = 5, list = TRUE)
+folds <- createFolds(train_set$rating, k = 10, list = TRUE, returnTrain = TRUE)
 sets <- lapply(folds, function(fold) {
   train_set[-fold,]
 })
 lambdas <- 10^-(3:6)
-set <- sets$Resample1
+set <- sets$Fold01
 lambda <- lambdas[1]
 set_index <- split(1:nrow(set), set$userId)
 # Assign 10% of each user's rating to the test set
-test_index <- sapply(set_index, function(ind) sample(ind, ceiling(length(ind)*.1))) |>
+test_index <- sapply(set_index, function(ind) sample(ind, floor(length(ind)*.1))) |>
   unlist(use.names = TRUE) |> sort()
 mini_test_set <- set[test_index,]
 mini_train_set <- set[-test_index,]
@@ -316,7 +316,6 @@ b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
 b_g <- setNames(fit$b_g$c, fit$b_g$genres)
 b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-p <- fit$p
 pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
 mini_test_set$pq <- pq
 resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
