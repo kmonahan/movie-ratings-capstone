@@ -319,8 +319,7 @@ b_d <- setNames(fit$b_d$d, fit$b_d$decade)
 p <- fit$p
 pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
 mini_test_set$pq <- pq
-# TODO: Why are there a bunch of NAs in my resids?
-resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
+resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
 rmse(resid)
 cores <- min(detectCores() - 1, 10)
 registerDoParallel(cores)
