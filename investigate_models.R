@@ -370,11 +370,46 @@ lambda_u <- 1e-05
 
 
 # TODO: Tune and select lambda_pq
+# Latent factors penalty (lambda_pq)
+# First try a wider range of Ks
+folds <- createFolds(train_set$rating, k = 10, list = TRUE, returnTrain = TRUE)
+sets <- lapply(folds, function(fold) {
+  train_set[-fold,]
+})
+lambdas <- 10^-(2:5)
+cores <- min(detectCores() - 1, 10)
+registerDoParallel(cores)
+results <- foreach(lambda = lambdas, .combine = c) %do% {
+  validations <- foreach(set = sets, .packages = c("caret", "data.table", "tidyverse"), .verbose = TRUE, .combine = c) %dopar% {
+    set_index <- split(1:nrow(set), set$userId)
+    # Assign 10% of each user's rating to the test set
+    test_index <- sapply(set_index, function(ind) sample(ind, floor(length(ind)*.1))) |>
+      unlist(use.names = TRUE) |> sort()
+    mini_test_set <- set[test_index,]
+    mini_train_set <- set[-test_index,]
+    # Remove any movies that are not in BOTH the test and training sets
+    mini_test_set <- mini_test_set |> 
+      semi_join(mini_train_set, by = "movieId")
+    mini_train_set <- mini_train_set |> 
+      semi_join(mini_test_set, by = "movieId")
+    
+    fit <- fit_als_with_latent(mini_train_set, max_iter = 50, tol = 1e-4, lambda_m = lambda_m, lambda_u = lambda_u, lambda_pq = lambda, K = 8, min_ratings = 0)
+    mu <- fit$mu
+    b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+    b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+    b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+    b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+    pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
+    mini_test_set$pq <- pq
+    resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
+    rmse(resid)
+  }
+  mean(validations)
+}
+stopImplicitCluster()
+lambda_pq <- 0.001
 
-
-# TODO: Tune and select K
-# TODO: Decrease tolerance back to original value
-fit <- fit_als_with_latent(train_set, max_iter = 50, tol = 1e-3)
+fit <- fit_als_with_latent(train_set, lambda_m = lambda_m, lambda_u = lambda_u, lambda_pq = lambda_pq, K = 8)
 mu <- fit$mu
 b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
