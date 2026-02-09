@@ -126,17 +126,23 @@ fit_als_with_latent <- function(data = train_set,
     pq <- rowSums(p[user_ids, -1, drop = FALSE] * q[movie_ids, -1, drop = FALSE])
     resid <- with(fit, rating - (mu + a + b + c + d + pq))
     
+    prev_p <- p
+    prev_q <- q
+    
     # For K latent factors, calculate the effect using ALS again
     for (k in 1:K) {
       q[min_ratings_index, k] <- sapply(movie_index_min, function(i) {
         x <- p[user_ids[i], k]
         sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
+      # Damping to prevent too much oscillation
+      q[, k] <- 0.75 * q[, k] + 0.25 * prev_q[, k]
       
       p[, k] <- sapply(user_index_min, function(i) {
         x <- q[movie_ids[i], k]
         sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
+      p[, k] <- 0.75 * p[, k] + 0.25 * prev_p[, k]
       
       resid <- resid - p[user_ids, k]*q[movie_ids, k]
     }
@@ -149,7 +155,7 @@ fit_als_with_latent <- function(data = train_set,
     # Check for convergence using Ridge regression/L2 regularization
     # Loss function is modified to include the regularization term,
     # so it's MSE + the sum of the co-efficient squared
-    loss <- mean(resid^2) + (sum(fit$a^2) * lambda_u) + (sum(fit$b^2) * lambda_m) + (sum(fit$pq^2) * lambda_pq)
+    loss <- mean(resid^2) + (sum(fit$a^2) * lambda_u) + (sum(fit$b^2) * lambda_m) + ((sum(fit$p^2) + sum(fit$q^2)) * lambda_pq)
     
     delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
     message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f", 
