@@ -39,7 +39,7 @@ fit_als_with_latent <- function(data = train_set,
                         lambda_pq = 5e-05,
                         min_ratings = 20,
                         tol = 1e-6,
-                        max_iter = 100) {
+                        max_iter = 25) {
   
   # Copy the data so we can mutate it at will
   fit <- as.data.table(copy(data))
@@ -158,11 +158,15 @@ fit_als_with_latent <- function(data = train_set,
     # Check for convergence using Ridge regression/L2 regularization
     # Loss function is modified to include the regularization term,
     # so it's MSE + the sum of the co-efficient squared
-    loss <- mean(resid^2) + (sum(fit$a^2) * lambda_u) + (sum(fit$b^2) * lambda_m) + (sum(fit$c^2) * lambda_g) + (sum(fit$d^2) * lambda_d) + ((sum(p^2) + sum(q^2)) * lambda_pq)
-    
+    b_u <- fit |> group_by(userId) |> summarize(a = first(a))
+    b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
+    b_g <- fit |> group_by(genres) |> summarize(c = first(c))
+    b_d <- fit |> group_by(decade) |> summarize(d = first(d))
+    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d) + ((sum(p^2) + sum(q^2)) * lambda_pq)
+    raw_mse <- mean(resid^2)
     delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
-    message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f", 
-                    iter, delta, loss))
+    message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f, Raw MSE = %.6f", 
+                    iter, delta, loss, raw_mse))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
     if (delta < tol)
@@ -197,11 +201,6 @@ fit_als_with_latent <- function(data = train_set,
   # Same multiplication for q
   q[min_ratings_index,] <- sweep(v, 2, sqrt(s$d), FUN = "*")
   # Now factors are ordered by importance -- the first column captures the most variance and so on
-  
-  b_u <- fit |> group_by(userId) |> summarize(a = first(a))
-  b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
-  b_g <- fit |> group_by(genres) |> summarize(c = first(c))
-  b_d <- fit |> group_by(decade) |> summarize(d = first(d))
   
 
   # Return the regularized effects
