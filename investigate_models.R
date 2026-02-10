@@ -32,12 +32,12 @@ baseline <- rmse(test_set$rating - mu)
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
                         K = 5,        
-                        lambda_u = 0.00005,
-                        lambda_m = 0.00005,
-                        lambda_pq = 0.001,
-                        min_ratings = 40,
+                        lambda_u = 1e-05,
+                        lambda_m = 1e-05,
+                        lambda_pq = 1e-04,
+                        min_ratings = 5,
                         tol = 1e-6,
-                        max_iter = 500) {
+                        max_iter = 50) {
   
   # Copy the data so we can mutate it at will
   fit <- as.data.table(copy(data))
@@ -81,6 +81,7 @@ fit_als_with_latent <- function(data = train_set,
   q <- matrix(rep(0, K * J), J, K)
   rownames(q) <- unique_movies
   pq <- rep(0, N)
+  fit$pq <- pq
   resid <- with(fit, rating - mu)
   prev_loss <- mean(resid^2)
   message(sprintf("Iteration 0: Loss = %.6f", 
@@ -88,11 +89,27 @@ fit_als_with_latent <- function(data = train_set,
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
+    # Calculate genre effect
+    fit_genre <- fit |> 
+      group_by(genres) |> 
+      summarize(c = sum(rating - mu - a - b - d - pq) / n(), genres = first(genres)) |> 
+      select(genres, c)
+    fit <- rows_update(fit, fit_genre, by = "genres")
+    rm(fit_genre)
+    
+    # Calculate decade effect
+    fit_decade <- fit |> 
+      group_by(decade) |> 
+      summarize(d = sum(rating - mu - a - b - c - pq) / n(), decade = first(decade)) |>
+      select(decade, d)
+    fit <- rows_update(fit, fit_decade, by = "decade")
+    rm(fit_decade)
+    
     # Estimate the user effect, given a movie, genre, and decade effect, and update
     # our user index
     fit_users <- fit |> 
       group_by(userId) |> 
-      summarize(a = sum(rating - mu - b - c - d) / (n() + lambda_u * N), userId = first(userId)) |> 
+      summarize(a = sum(rating - mu - b - c - d - pq) / (n() + lambda_u * N), userId = first(userId)) |> 
       select(userId, a)
     fit <- rows_update(fit, fit_users, by = "userId")
     rm(fit_users)
@@ -101,26 +118,11 @@ fit_als_with_latent <- function(data = train_set,
     # and update our movie index
     fit_movies <- fit |> 
       group_by(movieId) |> 
-      summarize(b = sum(rating - mu - a - c - d) / (n() + lambda_m * N), movieId = first(movieId)) |> 
+      summarize(b = sum(rating - mu - a - c - d - pq) / (n() + lambda_m * N), movieId = first(movieId)) |> 
       select(movieId, b)
     fit <- rows_update(fit, fit_movies, by = "movieId")
     rm(fit_movies)
     
-    # Calculate genre effect
-    fit_genre <- fit |> 
-      group_by(genres) |> 
-      summarize(c = sum(rating - mu - a - b - d) / n(), genres = first(genres)) |> 
-      select(genres, c)
-    fit <- rows_update(fit, fit_genre, by = "genres")
-    rm(fit_genre)
-    
-    # Calculate decade effect
-    fit_decade <- fit |> 
-      group_by(decade) |> 
-      summarize(d = sum(rating - mu - a - b - c) / n(), decade = first(decade)) |>
-      select(decade, d)
-    fit <- rows_update(fit, fit_decade, by = "decade")
-    rm(fit_decade)
     
     # Now calculate the initial pq
     pq <- rowSums(p[user_ids, -1, drop = FALSE] * q[movie_ids, -1, drop = FALSE])
@@ -136,13 +138,13 @@ fit_als_with_latent <- function(data = train_set,
         sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
       # Damping to prevent too much oscillation
-      q[, k] <- 0.75 * q[, k] + 0.25 * prev_q[, k]
+      q[, k] <- 0.9 * q[, k] + 0.1 * prev_q[, k]
       
       p[, k] <- sapply(user_index_min, function(i) {
         x <- q[movie_ids[i], k]
         sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
-      p[, k] <- 0.75 * p[, k] + 0.25 * prev_p[, k]
+      p[, k] <- 0.9 * p[, k] + 0.1 * prev_p[, k]
       
       resid <- resid - p[user_ids, k]*q[movie_ids, k]
     }
@@ -155,7 +157,7 @@ fit_als_with_latent <- function(data = train_set,
     # Check for convergence using Ridge regression/L2 regularization
     # Loss function is modified to include the regularization term,
     # so it's MSE + the sum of the co-efficient squared
-    loss <- mean(resid^2) + (sum(fit$a^2) * lambda_u) + (sum(fit$b^2) * lambda_m) + ((sum(fit$p^2) + sum(fit$q^2)) * lambda_pq)
+    loss <- mean(resid^2) + (sum(fit$a^2) * lambda_u) + (sum(fit$b^2) * lambda_m) + ((sum(p^2) + sum(q^2)) * lambda_pq)
     
     delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
     message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f", 
