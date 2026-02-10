@@ -31,13 +31,15 @@ baseline <- rmse(test_set$rating - mu)
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
-                        K = 5,        
+                        K = 7,        
                         lambda_u = 1e-05,
                         lambda_m = 1e-05,
-                        lambda_pq = 1e-04,
-                        min_ratings = 5,
+                        lambda_d = 0.0001,
+                        lambda_g = 0.0001,
+                        lambda_pq = 5e-05,
+                        min_ratings = 20,
                         tol = 1e-6,
-                        max_iter = 50) {
+                        max_iter = 100) {
   
   # Copy the data so we can mutate it at will
   fit <- as.data.table(copy(data))
@@ -89,22 +91,6 @@ fit_als_with_latent <- function(data = train_set,
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
-    # Calculate genre effect
-    fit_genre <- fit |> 
-      group_by(genres) |> 
-      summarize(c = sum(rating - mu - a - b - d - pq) / n(), genres = first(genres)) |> 
-      select(genres, c)
-    fit <- rows_update(fit, fit_genre, by = "genres")
-    rm(fit_genre)
-    
-    # Calculate decade effect
-    fit_decade <- fit |> 
-      group_by(decade) |> 
-      summarize(d = sum(rating - mu - a - b - c - pq) / n(), decade = first(decade)) |>
-      select(decade, d)
-    fit <- rows_update(fit, fit_decade, by = "decade")
-    rm(fit_decade)
-    
     # Estimate the user effect, given a movie, genre, and decade effect, and update
     # our user index
     fit_users <- fit |> 
@@ -123,6 +109,21 @@ fit_als_with_latent <- function(data = train_set,
     fit <- rows_update(fit, fit_movies, by = "movieId")
     rm(fit_movies)
     
+    # Calculate genre effect
+    fit_genre <- fit |> 
+      group_by(genres) |> 
+      summarize(c = sum(rating - mu - a - b - d - pq) / (n() + lambda_g * N), genres = first(genres)) |> 
+      select(genres, c)
+    fit <- rows_update(fit, fit_genre, by = "genres")
+    rm(fit_genre)
+    
+    # Calculate decade effect
+    fit_decade <- fit |> 
+     group_by(decade) |> 
+     summarize(d = sum(rating - mu - a - b - c - pq) / (n() + lambda_d * N), decade = first(decade)) |>
+     select(decade, d)
+    fit <- rows_update(fit, fit_decade, by = "decade")
+    rm(fit_decade)
     
     # Now calculate the initial pq
     pq <- rowSums(p[user_ids, -1, drop = FALSE] * q[movie_ids, -1, drop = FALSE])
@@ -138,13 +139,13 @@ fit_als_with_latent <- function(data = train_set,
         sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
       # Damping to prevent too much oscillation
-      q[, k] <- 0.9 * q[, k] + 0.1 * prev_q[, k]
+      q[, k] <- 0.8 * q[, k] + 0.2 * prev_q[, k]
       
       p[, k] <- sapply(user_index_min, function(i) {
         x <- q[movie_ids[i], k]
         sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
       })
-      p[, k] <- 0.9 * p[, k] + 0.1 * prev_p[, k]
+      p[, k] <- 0.8 * p[, k] + 0.2 * prev_p[, k]
       
       resid <- resid - p[user_ids, k]*q[movie_ids, k]
     }
@@ -157,7 +158,7 @@ fit_als_with_latent <- function(data = train_set,
     # Check for convergence using Ridge regression/L2 regularization
     # Loss function is modified to include the regularization term,
     # so it's MSE + the sum of the co-efficient squared
-    loss <- mean(resid^2) + (sum(fit$a^2) * lambda_u) + (sum(fit$b^2) * lambda_m) + ((sum(p^2) + sum(q^2)) * lambda_pq)
+    loss <- mean(resid^2) + (sum(fit$a^2) * lambda_u) + (sum(fit$b^2) * lambda_m) + (sum(fit$c^2) * lambda_g) + (sum(fit$d^2) * lambda_d) + ((sum(p^2) + sum(q^2)) * lambda_pq)
     
     delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
     message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f", 
@@ -216,7 +217,6 @@ fit_als_with_latent <- function(data = train_set,
 }
 
 
-ptm <- proc.time()
 fit <- fit_als_with_latent(train_set)
 mu <- fit$mu
 b_u <- setNames(fit$b_u$a, fit$b_u$userId)
@@ -228,16 +228,5 @@ pq <- rowSums(fit$p[as.character(test_set$userId), ] * fit$q[as.character(test_s
 test_set$pq <- pq
 resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
 with_latent <- rmse(resid)
-proc.time() - ptm
 
-# With tolerance of 1e-6 (since min-ratings doesn't affect it)
-# 2290.98 elapsed
-# 0.909580541096071 RMSE
-
-# With tolerance of 1e-8
-# 2523.61 elapsed
-# No change in RMSE
-
-# With 8 factors
-# 2318.87 elapsed
-# No change in RMSE
+# 0.8855778232756
