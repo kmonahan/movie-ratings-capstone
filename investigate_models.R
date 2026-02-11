@@ -27,6 +27,119 @@ mu <- mean(train_set$rating, na.rm = TRUE)
 # improves accuracy.
 baseline <- rmse(test_set$rating - mu)
 
+# ADDITIONAL MOVIE FEATURES EFFECT
+fit_als_with_known_effects <- function(data = train_set,
+                                lambda_u = 0.00001,
+                                lambda_m = 0.00001,
+                                lambda_d = 0.01,
+                                lambda_g = 0.001,
+                                tol = 1e-6,
+                                max_iter = 100) {
+  
+  # Copy the data so we can mutate it at will
+  fit <- as.data.table(copy(data))
+  
+  # Calculate some initial numbers
+  N <- nrow(fit)
+  mu <- mean(fit$rating)
+  
+  # Shorthand for easy reference
+  user_ids <- as.character(fit$userId)
+  movie_ids <- as.character(fit$movieId)
+  
+  # Index by user and movie.
+  user_index <- split(1:N, user_ids)
+  movie_index <- split(1:N, movie_ids)
+  
+  # Set initial user and movie effects of 0
+  fit$a <- rep(0, N)
+  fit$b <- rep(0, N)
+  fit$c <- rep(0, N)
+  fit$d <- rep(0, N)
+  
+  resid <- with(fit, rating - mu)
+  prev_loss <- mean(resid^2)
+  
+  # Now use ALS to calculate the movie and user effects and the latent effects
+  for (iter in 1:max_iter) {
+    # Estimate the user effect, given a movie, genre, and decade effect, and update
+    # our user index
+    fit_users <- fit |> 
+      group_by(userId) |> 
+      summarize(a = sum(rating - mu - b - c - d) / (n() + lambda_u * N), userId = first(userId)) |> 
+      select(userId, a)
+    fit <- rows_update(fit, fit_users, by = "userId")
+    rm(fit_users)
+    
+    # Now estimate the movie effect, given a user, genre, and decade effect,
+    # and update our movie index
+    fit_movies <- fit |> 
+      group_by(movieId) |> 
+      summarize(b = sum(rating - mu - a - c - d) / (n() + lambda_m * N), movieId = first(movieId)) |> 
+      select(movieId, b)
+    fit <- rows_update(fit, fit_movies, by = "movieId")
+    rm(fit_movies)
+    
+    # Calculate genre effect
+    fit_genre <- fit |> 
+      group_by(genres) |> 
+      summarize(c = sum(rating - mu - a - b - d) / (n() + lambda_g * N), genres = first(genres)) |> 
+      select(genres, c)
+    fit <- rows_update(fit, fit_genre, by = "genres")
+    rm(fit_genre)
+    
+    # Calculate decade effect
+    fit_decade <- fit |> 
+      group_by(decade) |> 
+      summarize(d = sum(rating - mu - a - b - c) / (n() + lambda_d * N), decade = first(decade)) |>
+      select(decade, d)
+    fit <- rows_update(fit, fit_decade, by = "decade")
+    rm(fit_decade)
+
+    resid <- with(fit, rating - (mu + a + b + c + d))
+    
+    # Check for convergence using Ridge regression/L2 regularization
+    # Loss function is modified to include the regularization term,
+    # so it's MSE + the sum of the co-efficient squared
+    b_u <- fit |> group_by(userId) |> summarize(a = first(a))
+    b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
+    b_g <- fit |> group_by(genres) |> summarize(c = first(c))
+    b_d <- fit |> group_by(decade) |> summarize(d = first(d))
+    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d)
+    raw_mse <- mean(resid^2)
+    delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
+    message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f, Raw MSE = %.6f", 
+                    iter, delta, loss, raw_mse))
+    # If the update is less than what we set as our tolerance, we're done!
+    # Otherwise, it'll keep going until we hit max_iter iterations.
+    # The second check is to prevent bad values from growing so exponentially 
+    # that we overload R
+    if (delta < tol | delta > 1e07)
+      break
+    prev_loss <- loss
+  }
+  
+  
+  # Return the regularized effects
+  list(
+    mu = mu,
+    b_u = b_u,
+    b_i = b_i,
+    b_g = b_g,
+    b_d = b_d
+  )
+}
+
+fit <- fit_als_with_known_effects(train_set)
+mu <- fit$mu
+b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+
+resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
+with_known_effects <- rmse(resid)
+
 
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
@@ -36,10 +149,10 @@ fit_als_with_latent <- function(data = train_set,
                         lambda_m = 0.00001,
                         lambda_d = 0.01,
                         lambda_g = 0.001,
-                        lambda_pq = 0.0001,
-                        min_ratings = 20,
-                        tol = 1e-6,
-                        max_iter = 100) {
+                        lambda_pq = 1e-7,
+                        min_ratings = 40,
+                        tol = 1e-8,
+                        max_iter = 500) {
   
   # Copy the data so we can mutate it at will
   fit <- as.data.table(copy(data))
