@@ -31,15 +31,15 @@ baseline <- rmse(test_set$rating - mu)
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
-                        K = 7,        
-                        lambda_u = 1e-05,
-                        lambda_m = 1e-05,
-                        lambda_d = 0.0001,
-                        lambda_g = 0.0001,
-                        lambda_pq = 5e-05,
+                        K = 5,        
+                        lambda_u = 0.00001,
+                        lambda_m = 0.00001,
+                        lambda_d = 0.01,
+                        lambda_g = 0.001,
+                        lambda_pq = 0.0001,
                         min_ratings = 20,
                         tol = 1e-6,
-                        max_iter = 25) {
+                        max_iter = 100) {
   
   # Copy the data so we can mutate it at will
   fit <- as.data.table(copy(data))
@@ -169,7 +169,9 @@ fit_als_with_latent <- function(data = train_set,
                     iter, delta, loss, raw_mse))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
-    if (delta < tol)
+    # The second check is to prevent bad values from growing so exponentially 
+    # that we overload R
+    if (delta < tol | delta > 1e07)
       break
     prev_loss <- loss
   }
@@ -222,10 +224,12 @@ b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
 b_g <- setNames(fit$b_g$c, fit$b_g$genres)
 b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-
+ 
 pq <- rowSums(fit$p[as.character(test_set$userId), ] * fit$q[as.character(test_set$movieId), ])
 test_set$pq <- pq
 resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
 with_latent <- rmse(resid)
+
+save(fit, file="rdas/fit.RData")
 
 # 0.8855778232756

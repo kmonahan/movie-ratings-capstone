@@ -220,8 +220,10 @@ min_rating <- 0
 
 lambda_m_vals <- c(1e-05, 3e-05, 5e-05)
 lambda_u_vals <- c(1e-05, 3e-05, 5e-05)
-lambda_pq_vals <- c(0.001, 0.005, 0.0001)
-k_vals <- c(5, 8, 10)
+lambda_pq_vals <- c(1e-03, 1e-04, 1e-05)
+lambda_d_vals <- c(0.01, 0.001, 0.0001)
+lambda_g_vals <- c(0.001, 0.0001)
+k_vals <- c(5, 7, 9)
 
 # Start with users who have rated at least 100 movies and movies rated by those
 # users at least 5 times
@@ -233,7 +235,7 @@ filtered_train_set <- train_set |>
   filter(n() >= 5) |>
   ungroup()
 
-# Randomly choose 200,000 ratings from that group
+# Randomly choose 100,000 ratings from that group
 one_hundred_k_set <- sample_n(filtered_train_set, 100000)
 
 samples <- createResample(
@@ -254,8 +256,8 @@ sets <- lapply(samples, function(sample) {
 
 tuning_grid <- crossing(
   lambda_m = lambda_m_vals,
-  lambda_u = lambda_u_vals,
   lambda_pq = lambda_pq_vals,
+  lambda_d = lambda_d_vals,
   K = k_vals
 )
 n <- nrow(tuning_grid)
@@ -290,11 +292,13 @@ results <- foreach(
                            
                            fit <- fit_als_with_latent(
                              mini_train_set,
-                             max_iter = 100,
+                             max_iter = 25,
                              tol = 1e-4,
                              lambda_m = tuning_grid_row$lambda_m,
-                             lambda_u = tuning_grid_row$lambda_u,
+                             lambda_u = tuning_grid_row$lambda_m,
                              lambda_pq = tuning_grid_row$lambda_pq,
+                             lambda_d = tuning_grid_row$lambda_d,
+                             lambda_g = tuning_grid_row$lambda_d,
                              K = tuning_grid_row$K,
                              min_ratings = 0
                            )
@@ -319,61 +323,3 @@ lambda_m <- 0.00005
 lambda_u <- 0.00005
 lambda_pq <- 0.001
 K <- 5
-
-# Try the K's again, since now we know the penalty values
-folds <- createFolds(train_set$rating,
-                     k = 10,
-                     list = TRUE,
-                     returnTrain = TRUE)
-sets <- lapply(folds, function(fold) {
-  train_set[-fold, ]
-})
-k_vals <- c(2, 4, 8, 16, 32)
-cores <- min(detectCores() - 1, 10)
-registerDoParallel(cores)
-results <- foreach(k = k_vals, .combine = c) %do% {
-  validations <- foreach(
-    set = sets,
-    .packages = c("caret", "data.table", "tidyverse"),
-    .verbose = TRUE,
-    .combine = c
-  ) %dopar% {
-    set <- sets$Fold01
-    k <- k_vals[1]
-    set_index <- split(1:nrow(set), set$userId)
-    # Assign 10% of each user's rating to the test set
-    test_index <- sapply(set_index, function(ind)
-      sample(ind, floor(length(ind) * .1))) |>
-      unlist(use.names = TRUE) |> sort()
-    mini_test_set <- set[test_index, ]
-    mini_train_set <- set[-test_index, ]
-    # Remove any movies that are not in BOTH the test and training sets
-    mini_test_set <- mini_test_set |>
-      semi_join(mini_train_set, by = "movieId")
-    mini_train_set <- mini_train_set |>
-      semi_join(mini_test_set, by = "movieId")
-    # Remove any users that are now only in the test set
-    mini_test_set <- mini_test_set |>
-      semi_join(mini_train_set, by = "userId")
-    
-    fit <- fit_als_with_latent(
-      mini_train_set,
-      max_iter = 50,
-      tol = 1e-4,
-      K = k,
-      min_ratings = 0
-    )
-    mu <- fit$mu
-    b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-    b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-    b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-    b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-    pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
-    mini_test_set$pq <- pq
-    resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
-    rmse(resid)
-  }
-  mean(validations)
-}
-stopImplicitCluster()
-lambda_pq <- 0.001
