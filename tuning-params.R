@@ -319,7 +319,120 @@ stopImplicitCluster()
 tuning_grid[which.min(results),]
 
 # Final answers:
+# Except not final, because these are wrong.
 lambda_m <- 0.00005
 lambda_u <- 0.00005
 lambda_pq <- 0.001
 K <- 5
+
+# Randomly choose 625,000 ratings
+five_hundred_k_set <- sample_n(train_set, 625000)
+five_hundred_k_set <-  as.data.table(five_hundred_k_set)
+
+# Create our test and training sets by assigning 20% of the ratings made by
+# each user to our test set
+indexes <- split(1:nrow(five_hundred_k_set), five_hundred_k_set$userId)
+test_ind <- sapply(indexes, function(ind) sample(ind, ceiling(length(ind)*.2))) |>
+  unlist(use.names = TRUE) |> sort()
+temp <- five_hundred_k_set[test_ind,]
+mini_train_set <- five_hundred_k_set[-test_ind,]
+
+# Make sure movies and users in the test set are also in the training set
+mini_test_set <- temp |> 
+  semi_join(mini_train_set, by = "movieId") |>
+  semi_join(mini_train_set, by = "userId")
+removed <- anti_join(temp, mini_test_set)
+mini_train_set <- rbind(mini_train_set, removed)
+rm(temp)
+
+lambda_pq_vals <- c(5, 10, 15, 20)
+results <- foreach(lambda_pq = lambda_pq_vals, .combine=c) %do% {
+  fit <- fit_als_with_latent(
+    mini_train_set,
+    lambda_pq = lambda_pq,
+  )
+  mu <- fit$mu
+  b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+  b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+  b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+  b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+  pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
+  mini_test_set$pq <- pq
+  resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
+  rmse(resid)
+}
+
+# And again
+five_hundred_k_set <- sample_n(train_set, 625000)
+five_hundred_k_set <-  as.data.table(five_hundred_k_set)
+
+indexes <- split(1:nrow(five_hundred_k_set), five_hundred_k_set$userId)
+test_ind <- sapply(indexes, function(ind) sample(ind, ceiling(length(ind)*.2))) |>
+  unlist(use.names = TRUE) |> sort()
+temp <- five_hundred_k_set[test_ind,]
+mini_train_set <- five_hundred_k_set[-test_ind,]
+
+# Make sure movies and users in the test set are also in the training set
+mini_test_set <- temp |> 
+  semi_join(mini_train_set, by = "movieId") |>
+  semi_join(mini_train_set, by = "userId")
+removed <- anti_join(temp, mini_test_set)
+mini_train_set <- rbind(mini_train_set, removed)
+rm(temp)
+
+cores <- min(detectCores() - 1, 15)
+registerDoParallel(cores)
+lambda_pq_vals <- c(5, 7, 10)
+results <- foreach(lambda_pq = lambda_pq_vals, .combine=c, .packages = c("caret", "data.table", "tidyverse", "foreach")) %dopar% {
+  fit <- fit_als_with_latent(
+    mini_train_set,
+    lambda_pq = lambda_pq,
+  )
+  mu <- fit$mu
+  b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+  b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+  b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+  b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+  pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
+  mini_test_set$pq <- pq
+  resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
+  rmse(resid)
+}
+stopImplicitCluster()
+
+k_vals <- c(5, 7, 9)
+five_hundred_k_set <- sample_n(train_set, 625000)
+five_hundred_k_set <-  as.data.table(five_hundred_k_set)
+
+indexes <- split(1:nrow(five_hundred_k_set), five_hundred_k_set$userId)
+test_ind <- sapply(indexes, function(ind) sample(ind, ceiling(length(ind)*.2))) |>
+  unlist(use.names = TRUE) |> sort()
+temp <- five_hundred_k_set[test_ind,]
+mini_train_set <- five_hundred_k_set[-test_ind,]
+
+# Make sure movies and users in the test set are also in the training set
+mini_test_set <- temp |> 
+  semi_join(mini_train_set, by = "movieId") |>
+  semi_join(mini_train_set, by = "userId")
+removed <- anti_join(temp, mini_test_set)
+mini_train_set <- rbind(mini_train_set, removed)
+rm(temp)
+
+cores <- min(detectCores() - 1, 15)
+registerDoParallel(cores)
+results <- foreach(K = k_vals, .combine=c, .packages = c("caret", "data.table", "tidyverse", "foreach")) %dopar% {
+  fit <- fit_als_with_latent(
+    mini_train_set,
+    K = K,
+  )
+  mu <- fit$mu
+  b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+  b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+  b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+  b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+  pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
+  mini_test_set$pq <- pq
+  resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
+  rmse(resid)
+}
+stopImplicitCluster()

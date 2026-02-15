@@ -130,29 +130,29 @@ fit_als_with_known_effects <- function(data = train_set,
   )
 }
 
-fit <- fit_als_with_known_effects(train_set)
-mu <- fit$mu
-b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-
-resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
-with_known_effects <- rmse(resid)
+# fit <- fit_als_with_known_effects(train_set)
+# mu <- fit$mu
+# b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+# b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+# b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+# b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+# 
+# resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
+# with_known_effects <- rmse(resid)
 
 
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
-                        K = 5,        
+                        K = 7,        
                         lambda_u = 0.00001,
                         lambda_m = 0.00001,
                         lambda_d = 0.01,
                         lambda_g = 0.001,
                         lambda_pq = 10,
-                        min_ratings = 40,
+                        min_ratings = 20,
                         tol = 1e-6,
-                        max_iter = 100) {
+                        max_iter = 500) {
   
   # Copy the data so we can mutate it at will
   fit <- as.data.table(copy(data))
@@ -178,6 +178,7 @@ fit_als_with_latent <- function(data = train_set,
   movie_ids_by_length <- n_item[movie_ids]
   min_data_index <- which(movie_ids_by_length >= min_ratings)
   user_index_min <- split(min_data_index, user_ids[min_data_index])
+  users_with_min_ratings <- names(user_index_min)
   
   # Set initial user and movie effects of 0
   fit$a <- rep(0, N)
@@ -244,27 +245,19 @@ fit_als_with_latent <- function(data = train_set,
     prev_q <- q
     
     # For K latent factors, calculate the effect using ALS again
-    # numerator: -0.40927661, denominator: 25.27217519, value: -0.01619475
-    # numerator: -0.04970590, denominator: 25.17030991, value: -0.00197478
-    # numerator: -0.00519023, denominator: 25.02657342, value: -0.00020739
-    # numerator: -0.01971479, denominator: 25.00082604, value: -0.00078857
-    # numerator: 0.04349910, denominator: 25.00069453, value: 0.00173992
-    # numerator: 0.03398125, denominator: 25.01074474, value: 0.00135867
-    # numerator: 0.05868307, denominator: 25.00944546, value: 0.00234644
     for (k in 1:K) {
       q[min_ratings_index, k] <- sapply(movie_index_min, function(i) {
         x <- p[user_ids[i], k]
-        #message(sprintf("numerator: %.8f, denominator: %.8f, value: %.8f",  sum(x*resid[i]), (sum(x^2) + lambda_pq), sum(x*resid[i])/(sum(x^2) + lambda_pq)))
         sum(x*resid[i])/(sum(x^2) + lambda_pq)
       })
       # Damping to prevent too much oscillation
-      q[, k] <- 0.7 * q[, k] + 0.3 * prev_q[, k]
+      q[, k] <- 0.6 * q[, k] + 0.4 * prev_q[, k]
       
-      p[, k] <- sapply(user_index_min, function(i) {
+      p[users_with_min_ratings, k] <- sapply(user_index_min, function(i) {
         x <- q[movie_ids[i], k]
         sum(x*resid[i])/(sum(x^2) + lambda_pq)
       })
-      p[, k] <- 0.7 * p[, k] + 0.3 * prev_p[, k]
+      p[users_with_min_ratings, k] <- 0.6 * p[users_with_min_ratings, k] + 0.4 * prev_p[users_with_min_ratings, k]
       
       resid <- resid - p[user_ids, k]*q[movie_ids, k]
     }
@@ -281,7 +274,7 @@ fit_als_with_latent <- function(data = train_set,
     b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
     b_g <- fit |> group_by(genres) |> summarize(c = first(c))
     b_d <- fit |> group_by(decade) |> summarize(d = first(d))
-    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d)
+    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d) + ((sum(p^2) + sum(q^2)) * (lambda_pq / N))
     raw_mse <- mean(resid^2)
     delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
     message(sprintf("Iteration %d: Delta = %.8f, Loss = %.6f, Raw MSE = %.8f", 
@@ -343,7 +336,7 @@ b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
 b_g <- setNames(fit$b_g$c, fit$b_g$genres)
 b_d <- setNames(fit$b_d$d, fit$b_d$decade)
- 
+
 pq <- rowSums(fit$p[as.character(test_set$userId), ] * fit$q[as.character(test_set$movieId), ])
 test_set$pq <- pq
 resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
