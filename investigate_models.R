@@ -29,87 +29,47 @@ baseline <- rmse(test_set$rating - mu)
 
 # ADDITIONAL MOVIE FEATURES EFFECT
 fit_als_with_known_effects <- function(data = train_set,
-                                lambda_u = 0.00001,
-                                lambda_m = 0.00001,
-                                lambda_d = 0.01,
-                                lambda_g = 0.001,
+                                       lambda_u = 50,
+                                       lambda_m = 100,
+                                       lambda_g = 10000,
                                 tol = 1e-6,
-                                max_iter = 100) {
+                                max_iter = 500) {
   
   # Copy the data so we can mutate it at will
-  fit <- as.data.table(copy(data))
+  dt <- as.data.table(copy(data))
   
   # Calculate some initial numbers
-  N <- nrow(fit)
-  mu <- mean(fit$rating)
+  N <- nrow(dt)
+  mu <- mean(dt$rating)
   
-  # Shorthand for easy reference
-  user_ids <- as.character(fit$userId)
-  movie_ids <- as.character(fit$movieId)
+  # Initialize the residuals and the various effects
+  dt[, resid := rating - mu]
+  b_i_dt <- b_u_dt <- b_g_dt <- b_d_dt <- NULL
+  prev_loss <- rmse(dt$resid)
   
-  # Index by user and movie.
-  user_index <- split(1:N, user_ids)
-  movie_index <- split(1:N, movie_ids)
-  
-  # Set initial user and movie effects of 0
-  fit$a <- rep(0, N)
-  fit$b <- rep(0, N)
-  fit$c <- rep(0, N)
-  fit$d <- rep(0, N)
-  
-  resid <- with(fit, rating - mu)
-  prev_loss <- mean(resid^2)
-  
-  # Now use ALS to calculate the movie and user effects and the latent effects
+  # Now use ALS to calculate the move, user, genre, and decade effects
   for (iter in 1:max_iter) {
-    # Estimate the user effect, given a movie, genre, and decade effect, and update
-    # our user index
-    fit_users <- fit |> 
-      group_by(userId) |> 
-      summarize(a = sum(rating - mu - b - c - d) / (n() + lambda_u * N), userId = first(userId)) |> 
-      select(userId, a)
-    fit <- rows_update(fit, fit_users, by = "userId")
-    rm(fit_users)
+    # Estimate the movie effect
+    b_i_dt <- dt[, .(b = sum(resid) / (.N + lambda_m)), by = movieId]
+    dt[b_i_dt, on = "movieId", bi := i.b]
+    dt[, resid := rating - mu - bi]
     
-    # Now estimate the movie effect, given a user, genre, and decade effect,
-    # and update our movie index
-    fit_movies <- fit |> 
-      group_by(movieId) |> 
-      summarize(b = sum(rating - mu - a - c - d) / (n() + lambda_m * N), movieId = first(movieId)) |> 
-      select(movieId, b)
-    fit <- rows_update(fit, fit_movies, by = "movieId")
-    rm(fit_movies)
+    # Estimate the movie effect, given a user effect,
+    b_u_dt <- dt[, .(a = sum(resid) / (.N + lambda_u)), by = userId]
+    dt[b_u_dt, on = "userId", bu := i.a]
+    dt[, resid := rating - mu - bi - bu]
     
-    # Calculate genre effect
-    fit_genre <- fit |> 
-      group_by(genres) |> 
-      summarize(c = sum(rating - mu - a - b - d) / (n() + lambda_g * N), genres = first(genres)) |> 
-      select(genres, c)
-    fit <- rows_update(fit, fit_genre, by = "genres")
-    rm(fit_genre)
+    # Estimate the genre effect, given a movie effect and user effect
+    b_g_dt <- dt[, .(c = sum(resid) / (.N + lambda_g)), by = genres]
+    dt[b_g_dt, on = "genres", bg := i.c]
+    dt[, resid := rating - mu - bi - bu - bg]
     
-    # Calculate decade effect
-    fit_decade <- fit |> 
-      group_by(decade) |> 
-      summarize(d = sum(rating - mu - a - b - c) / (n() + lambda_d * N), decade = first(decade)) |>
-      select(decade, d)
-    fit <- rows_update(fit, fit_decade, by = "decade")
-    rm(fit_decade)
-
-    resid <- with(fit, rating - (mu + a + b + c + d))
+    # Check for convergence
+    loss <- rmse(dt$resid)
+    delta <- abs(loss - prev_loss) / prev_loss
     
-    # Check for convergence using Ridge regression/L2 regularization
-    # Loss function is modified to include the regularization term,
-    # so it's MSE + the sum of the co-efficient squared
-    b_u <- fit |> group_by(userId) |> summarize(a = first(a))
-    b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
-    b_g <- fit |> group_by(genres) |> summarize(c = first(c))
-    b_d <- fit |> group_by(decade) |> summarize(d = first(d))
-    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d)
-    raw_mse <- mean(resid^2)
-    delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
-    message(sprintf("Iteration %d: Delta = %.8f, Loss = %.6f, Raw MSE = %.8f", 
-                    iter, delta, loss, raw_mse))
+    message(sprintf("Iteration %d: Delta = %.8f, Loss = %.6f", 
+                    iter, delta, loss))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
     # The second check is to prevent bad values from growing so exponentially 
@@ -123,33 +83,31 @@ fit_als_with_known_effects <- function(data = train_set,
   # Return the regularized effects
   list(
     mu = mu,
-    b_u = b_u,
-    b_i = b_i,
-    b_g = b_g,
-    b_d = b_d
+    b_i = as.data.frame(b_i_dt),
+    b_u = as.data.frame(b_u_dt),
+    b_g = as.data.frame(b_g_dt)
   )
 }
 
 # fit <- fit_als_with_known_effects(train_set)
 # mu <- fit$mu
-# b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 # b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+# b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 # b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-# b_d <- setNames(fit$b_d$d, fit$b_d$decade)
 # 
-# resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
+# resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres]))
 # with_known_effects <- rmse(resid)
 
 
 # ADDITIONAL MOVIE FEATURES EFFECT
 # Effect of genre on movie * effect of genre on user
 fit_als_with_latent <- function(data = train_set,
-                        K = 7,        
-                        lambda_u = 0.00001,
-                        lambda_m = 0.00001,
-                        lambda_d = 0.01,
-                        lambda_g = 0.001,
-                        lambda_pq = 10,
+                        K = 16,        
+                        lambda_u = 5,
+                        lambda_m = 5,
+                        lambda_d = 10,
+                        lambda_g = 10,
+                        lambda_pq = 0.02,
                         min_ratings = 20,
                         tol = 1e-6,
                         max_iter = 500) {
@@ -203,42 +161,28 @@ fit_als_with_latent <- function(data = train_set,
   
   # Now use ALS to calculate the movie and user effects and the latent effects
   for (iter in 1:max_iter) {
+    # Update pq from the current p and q
+    fit[, pq := rowSums(p[user_ids, , drop = FALSE] * q[movie_ids, , drop = FALSE])]
+    
     # Estimate the user effect, given a movie, genre, and decade effect, and update
     # our user index
-    fit_users <- fit |> 
-      group_by(userId) |> 
-      summarize(a = sum(rating - mu - b - c - d - pq) / (n() + lambda_u * N), userId = first(userId)) |> 
-      select(userId, a)
-    fit <- rows_update(fit, fit_users, by = "userId")
-    rm(fit_users)
+    a_vals <- fit[, .(a = sum(rating - mu - b - c - d - pq) / (.N + lambda_u)), by = userId]
+    fit[a_vals, a := i.a, on = "userId"]
     
     # Now estimate the movie effect, given a user, genre, and decade effect,
     # and update our movie index
-    fit_movies <- fit |> 
-      group_by(movieId) |> 
-      summarize(b = sum(rating - mu - a - c - d - pq) / (n() + lambda_m * N), movieId = first(movieId)) |> 
-      select(movieId, b)
-    fit <- rows_update(fit, fit_movies, by = "movieId")
-    rm(fit_movies)
+    b_vals <- fit[, .(b = sum(rating - mu - a - c - d - pq) / (.N + lambda_m)), by = movieId]
+    fit[b_vals, b := i.b, on = "movieId"]
     
     # Calculate genre effect
-    fit_genre <- fit |> 
-      group_by(genres) |> 
-      summarize(c = sum(rating - mu - a - b - d - pq) / (n() + lambda_g * N), genres = first(genres)) |> 
-      select(genres, c)
-    fit <- rows_update(fit, fit_genre, by = "genres")
-    rm(fit_genre)
+    c_vals <- fit[, .(c = sum(rating - mu - a - b - d - pq) / (.N + lambda_g)), by = genres]
+    fit[c_vals, c := i.c, on = "genres"]
     
     # Calculate decade effect
-    fit_decade <- fit |> 
-     group_by(decade) |> 
-     summarize(d = sum(rating - mu - a - b - c - pq) / (n() + lambda_d * N), decade = first(decade)) |>
-     select(decade, d)
-    fit <- rows_update(fit, fit_decade, by = "decade")
-    rm(fit_decade)
+    d_vals <- fit[, .(d = sum(rating - mu - a - b - c - pq) / (.N + lambda_d)), by = decade]
+    fit[d_vals, d := i.d, on = "decade"]
     
-    # Now calculate the initial pq
-    pq <- rowSums(p[user_ids, -1, drop = FALSE] * q[movie_ids, -1, drop = FALSE])
+    # Now calculate the initial residual
     resid <- with(fit, rating - (mu + a + b + c + d + pq))
     
     prev_p <- p
@@ -246,18 +190,16 @@ fit_als_with_latent <- function(data = train_set,
     
     # For K latent factors, calculate the effect using ALS again
     for (k in 1:K) {
+      resid <- resid + p[user_ids, k] * q[movie_ids, k]  # add back factor k
       q[min_ratings_index, k] <- sapply(movie_index_min, function(i) {
         x <- p[user_ids[i], k]
-        sum(x*resid[i])/(sum(x^2) + lambda_pq)
+        sum(x*resid[i])/(sum(x^2) +  lambda_pq * length(i))
       })
-      # Damping to prevent too much oscillation
-      q[, k] <- 0.6 * q[, k] + 0.4 * prev_q[, k]
       
       p[users_with_min_ratings, k] <- sapply(user_index_min, function(i) {
         x <- q[movie_ids[i], k]
-        sum(x*resid[i])/(sum(x^2) + lambda_pq)
+        sum(x*resid[i])/(sum(x^2) +  lambda_pq * length(i))
       })
-      p[users_with_min_ratings, k] <- 0.6 * p[users_with_min_ratings, k] + 0.4 * prev_p[users_with_min_ratings, k]
       
       resid <- resid - p[user_ids, k]*q[movie_ids, k]
     }
@@ -269,23 +211,26 @@ fit_als_with_latent <- function(data = train_set,
     
     # Check for convergence using Ridge regression/L2 regularization
     # Loss function is modified to include the regularization term,
-    # so it's MSE + the sum of the co-efficient squared
-    b_u <- fit |> group_by(userId) |> summarize(a = first(a))
-    b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
-    b_g <- fit |> group_by(genres) |> summarize(c = first(c))
-    b_d <- fit |> group_by(decade) |> summarize(d = first(d))
-    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d) + ((sum(p^2) + sum(q^2)) * (lambda_pq / N))
-    raw_mse <- mean(resid^2)
-    delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
-    message(sprintf("Iteration %d: Delta = %.8f, Loss = %.6f, Raw MSE = %.8f", 
-                    iter, delta, loss, raw_mse))
-    # If the update is less than what we set as our tolerance, we're done!
-    # Otherwise, it'll keep going until we hit max_iter iterations.
-    # The second check is to prevent bad values from growing so exponentially 
-    # that we overload R
-    if (delta < tol | delta > 1e07)
-      break
-    prev_loss <- loss
+    # so it's MSE + the sum of the co-efficient squared.
+    # Check every 5 iterations to speed things a bit.
+    if (iter %% 5 == 0 || iter <= 3) {
+      b_u <- a_vals
+      b_i <- b_vals
+      b_g <- c_vals
+      b_d <- d_vals
+      loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u / N) + (sum(b_i$b^2) * lambda_m / N) + (sum(b_g$c^2) * lambda_g / N) + (sum(b_d$d^2) * lambda_d / N) + ((sum(p^2) + sum(q^2)) * lambda_pq / N)
+      raw_rmse <- rmse(resid)
+      delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
+      message(sprintf("Iteration %d: Delta = %.8f, Loss = %.6f, Raw RMSE = %.8f", 
+                      iter, delta, loss, raw_rmse))
+      # If the update is less than what we set as our tolerance, we're done!
+      # Otherwise, it'll keep going until we hit max_iter iterations.
+      # The second check is to prevent bad values from growing so exponentially 
+      # that we overload R
+      if (delta < tol | delta > 1e07)
+        break
+      prev_loss <- loss
+    }
   }
   
   # Create canonical form of orthogonal factors, ordered by importance
@@ -330,68 +275,17 @@ fit_als_with_latent <- function(data = train_set,
 }
 
 
-fit <- fit_als_with_latent(train_set)
-mu <- fit$mu
-b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-
-pq <- rowSums(fit$p[as.character(test_set$userId), ] * fit$q[as.character(test_set$movieId), ])
-test_set$pq <- pq
-resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
-with_latent <- rmse(resid)
-
-# Numbers of doom
-# Iteration 1: Delta = 0.27261865, Loss = 0.818034, Raw MSE = 0.77592902
-# Iteration 2: Delta = 0.02167575, Loss = 0.800303, Raw MSE = 0.76088064
-# Iteration 3: Delta = 0.00108364, Loss = 0.799436, Raw MSE = 0.75999412
-# Iteration 4: Delta = 0.00057847, Loss = 0.798973, Raw MSE = 0.75975871
-# Iteration 5: Delta = 0.00040811, Loss = 0.798647, Raw MSE = 0.75962817
-# Iteration 6: Delta = 0.00030076, Loss = 0.798407, Raw MSE = 0.75953410
-# Iteration 7: Delta = 0.00023032, Loss = 0.798223, Raw MSE = 0.75946043
-# Iteration 8: Delta = 0.00018193, Loss = 0.798078, Raw MSE = 0.75940063
-# Iteration 9: Delta = 0.00014716, Loss = 0.797960, Raw MSE = 0.75935100
-# Iteration 10: Delta = 0.00012119, Loss = 0.797864, Raw MSE = 0.75930910
-# Iteration 11: Delta = 0.00010117, Loss = 0.797783, Raw MSE = 0.75927324
-# Iteration 12: Delta = 0.00008535, Loss = 0.797715, Raw MSE = 0.75924223
-# Iteration 13: Delta = 0.00007259, Loss = 0.797657, Raw MSE = 0.75921517
-# Iteration 14: Delta = 0.00006215, Loss = 0.797607, Raw MSE = 0.75919139
-# Iteration 15: Delta = 0.00005350, Loss = 0.797565, Raw MSE = 0.75917038
-# Iteration 16: Delta = 0.00004626, Loss = 0.797528, Raw MSE = 0.75915171
-# Iteration 17: Delta = 0.00004015, Loss = 0.797496, Raw MSE = 0.75913507
-# Iteration 18: Delta = 0.00003497, Loss = 0.797468, Raw MSE = 0.75912018
-# Iteration 19: Delta = 0.00003054, Loss = 0.797443, Raw MSE = 0.75910683
-# Iteration 20: Delta = 0.00002674, Loss = 0.797422, Raw MSE = 0.75909481
-# Iteration 21: Delta = 0.00002347, Loss = 0.797403, Raw MSE = 0.75908399
-# Iteration 22: Delta = 0.00002064, Loss = 0.797387, Raw MSE = 0.75907422
-# Iteration 23: Delta = 0.00001819, Loss = 0.797372, Raw MSE = 0.75906538
-# Iteration 24: Delta = 0.00001605, Loss = 0.797360, Raw MSE = 0.75905737
-# Iteration 25: Delta = 0.00001418, Loss = 0.797348, Raw MSE = 0.75905011
-# Iteration 26: Delta = 0.00001255, Loss = 0.797338, Raw MSE = 0.75904351
-# Iteration 27: Delta = 0.00001112, Loss = 0.797329, Raw MSE = 0.75903751
-# Iteration 28: Delta = 0.00000986, Loss = 0.797322, Raw MSE = 0.75903205
-# Iteration 29: Delta = 0.00000875, Loss = 0.797315, Raw MSE = 0.75902707
-# Iteration 30: Delta = 0.00000777, Loss = 0.797308, Raw MSE = 0.75902253
-# Iteration 31: Delta = 0.00000691, Loss = 0.797303, Raw MSE = 0.75901838
-# Iteration 32: Delta = 0.00000614, Loss = 0.797298, Raw MSE = 0.75901459
-# Iteration 33: Delta = 0.00000547, Loss = 0.797294, Raw MSE = 0.75901113
-# Iteration 34: Delta = 0.00000487, Loss = 0.797290, Raw MSE = 0.75900796
-# Iteration 35: Delta = 0.00000433, Loss = 0.797286, Raw MSE = 0.75900505
-# Iteration 36: Delta = 0.00000386, Loss = 0.797283, Raw MSE = 0.75900238
-# Iteration 37: Delta = 0.00000344, Loss = 0.797281, Raw MSE = 0.75899994
-# Iteration 38: Delta = 0.00000306, Loss = 0.797278, Raw MSE = 0.75899769
-# Iteration 39: Delta = 0.00000273, Loss = 0.797276, Raw MSE = 0.75899563
-# Iteration 40: Delta = 0.00000243, Loss = 0.797274, Raw MSE = 0.75899373
-# Iteration 41: Delta = 0.00000217, Loss = 0.797272, Raw MSE = 0.75899199
-# Iteration 42: Delta = 0.00000193, Loss = 0.797271, Raw MSE = 0.75899038
-# Iteration 43: Delta = 0.00000172, Loss = 0.797269, Raw MSE = 0.75898891
-# Iteration 44: Delta = 0.00000154, Loss = 0.797268, Raw MSE = 0.75898754
-# Iteration 45: Delta = 0.00000137, Loss = 0.797267, Raw MSE = 0.75898629
-# Iteration 46: Delta = 0.00000122, Loss = 0.797266, Raw MSE = 0.75898513
-# Iteration 47: Delta = 0.00000109, Loss = 0.797265, Raw MSE = 0.75898406
-# Iteration 48: Delta = 0.00000097, Loss = 0.797264, Raw MSE = 0.75898308
-
-save(fit, file="rdas/fit.RData")
+# fit <- fit_als_with_latent(train_set)
+# mu <- fit$mu
+# b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+# b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+# b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+# b_d <- setNames(fit$b_d$d, fit$b_d$decade)
+# 
+# pq <- rowSums(fit$p[as.character(test_set$userId), ] * fit$q[as.character(test_set$movieId), ])
+# test_set$pq <- pq
+# resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
+# with_latent <- rmse(resid)
+# save(fit, file="rdas/fit.RData")
 
 # 0.8855778232756
