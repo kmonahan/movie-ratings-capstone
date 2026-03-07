@@ -67,6 +67,11 @@ rm(dl, ratings, movies, test_index, temp, movielens, removed)
 ##########################################################
 # End of required starting code
 ##########################################################
+library(tidyverse)
+library(doParallel)
+library(foreach)
+library(data.table)
+
 
 ##########################################################
 # Step 1: Split edx data into training and test sets
@@ -173,95 +178,55 @@ baseline <- rmse(test_set$rating - mu)
 # Step 5: Model using only non-latent effects
 #######################################################
 
-# I originally tested this and then deleted the function
-# as I focused on the model with latent effects, so what's
-# here is a reconstruction of the function based on what
-# I used for latent effects. Hence we're jumping straight
-# to the lambda values I ended up using.
+# This went through many variations before I finally ended up with a working
+# value. I tried both using constant values of lambdas and lambdas as a percentage
+# of N. I went with the constant values as it was easier to understand the value
+# and scale, whereas my percentages kept being orders of magnitude off.
+
+# You'll also notice I dropped decade here. I originally included it but found
+# in practice that it had a small effect on the overall accuracy and so I could
+# simplify a bit.
 
 fit_als_with_known_effects <- function(data = train_set,
-                                       lambda_u = 0.00001,
-                                       lambda_m = 0.00001,
-                                       lambda_d = 0.01,
-                                       lambda_g = 0.001,
+                                       lambda_u = 50,
+                                       lambda_m = 100,
+                                       lambda_g = 10000,
                                        tol = 1e-6,
-                                       max_iter = 100) {
+                                       max_iter = 500) {
   
   # Copy the data so we can mutate it at will
-  fit <- as.data.table(copy(data))
+  dt <- as.data.table(copy(data))
   
   # Calculate some initial numbers
-  N <- nrow(fit)
-  mu <- mean(fit$rating)
+  N <- nrow(dt)
+  mu <- mean(dt$rating)
   
-  # Shorthand for easy reference
-  user_ids <- as.character(fit$userId)
-  movie_ids <- as.character(fit$movieId)
+  # Initialize the residuals and the various effects
+  dt[, resid := rating - mu]
+  b_i_dt <- b_u_dt <- b_g_dt <- b_d_dt <- NULL
+  prev_loss <- rmse(dt$resid)
   
-  # Index by user and movie.
-  user_index <- split(1:N, user_ids)
-  movie_index <- split(1:N, movie_ids)
-  
-  # Set initial user and movie effects of 0
-  fit$a <- rep(0, N)
-  fit$b <- rep(0, N)
-  fit$c <- rep(0, N)
-  fit$d <- rep(0, N)
-  
-  resid <- with(fit, rating - mu)
-  prev_loss <- mean(resid^2)
-  
-  # Now use ALS to calculate the movie and user effects and the latent effects
+  # Now use ALS to calculate the move, user, and genre effects
   for (iter in 1:max_iter) {
-    # Estimate the user effect, given a movie, genre, and decade effect, and update
-    # our user index
-    fit_users <- fit |> 
-      group_by(userId) |> 
-      summarize(a = sum(rating - mu - b - c - d) / (n() + lambda_u * N), userId = first(userId)) |> 
-      select(userId, a)
-    fit <- rows_update(fit, fit_users, by = "userId")
-    rm(fit_users)
+    # Estimate the movie effect
+    b_i_dt <- dt[, .(b = sum(resid) / (.N + lambda_m)), by = movieId]
+    dt[b_i_dt, on = "movieId", bi := i.b]
+    dt[, resid := rating - mu - bi]
     
-    # Now estimate the movie effect, given a user, genre, and decade effect,
-    # and update our movie index
-    fit_movies <- fit |> 
-      group_by(movieId) |> 
-      summarize(b = sum(rating - mu - a - c - d) / (n() + lambda_m * N), movieId = first(movieId)) |> 
-      select(movieId, b)
-    fit <- rows_update(fit, fit_movies, by = "movieId")
-    rm(fit_movies)
+    # Estimate the movie effect, given a user effect,
+    b_u_dt <- dt[, .(a = sum(resid) / (.N + lambda_u)), by = userId]
+    dt[b_u_dt, on = "userId", bu := i.a]
+    dt[, resid := rating - mu - bi - bu]
     
-    # Calculate genre effect
-    fit_genre <- fit |> 
-      group_by(genres) |> 
-      summarize(c = sum(rating - mu - a - b - d) / (n() + lambda_g * N), genres = first(genres)) |> 
-      select(genres, c)
-    fit <- rows_update(fit, fit_genre, by = "genres")
-    rm(fit_genre)
+    # Estimate the genre effect, given a movie effect and user effect
+    b_g_dt <- dt[, .(c = sum(resid) / (.N + lambda_g)), by = genres]
+    dt[b_g_dt, on = "genres", bg := i.c]
+    dt[, resid := rating - mu - bi - bu - bg]
     
-    # Calculate decade effect
-    fit_decade <- fit |> 
-      group_by(decade) |> 
-      summarize(d = sum(rating - mu - a - b - c) / (n() + lambda_d * N), decade = first(decade)) |>
-      select(decade, d)
-    fit <- rows_update(fit, fit_decade, by = "decade")
-    rm(fit_decade)
-    
-    resid <- with(fit, rating - (mu + a + b + c + d))
-    
-    # Check for convergence using Ridge regression/L2 regularization
-    # Loss function is modified to include the regularization term,
-    # so it's MSE + the sum of the co-efficient squared
-    
-    b_u <- fit |> group_by(userId) |> summarize(a = first(a))
-    b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
-    b_g <- fit |> group_by(genres) |> summarize(c = first(c))
-    b_d <- fit |> group_by(decade) |> summarize(d = first(d))
-    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d)
-    raw_mse <- mean(resid^2)
-    delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
-    message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f, Raw MSE = %.6f", 
-                    iter, delta, loss, raw_mse))
+    # Check for convergence
+    loss <- rmse(dt$resid)
+    delta <- abs(loss - prev_loss) / prev_loss
+
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
     # The second check is to prevent bad values from growing so exponentially 
@@ -275,173 +240,110 @@ fit_als_with_known_effects <- function(data = train_set,
   # Return the regularized effects
   list(
     mu = mu,
-    b_u = b_u,
-    b_i = b_i,
-    b_g = b_g,
-    b_d = b_d
+    b_i = as.data.frame(b_i_dt),
+    b_u = as.data.frame(b_u_dt),
+    b_g = as.data.frame(b_g_dt)
   )
 }
 
 fit <- fit_als_with_known_effects(train_set)
 mu <- fit$mu
-b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-
-resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)]))
+ 
+resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres]))
 with_known_effects <- rmse(resid)
+# At time of testing, with_known_effects was 0.962266925225248
 
-# At time of testing, with_known_effects is 0.883318173989364
+# For tuning, I calculated the mean and median number of ratings so I knew in
+# what general neighborhood the lambdas needed to be.
+b_u <- train_set |> group_by(userId) |> summarize(n=n())
+mean(b_u$n) # 102.6
+median(b_u$n) # 49
+b_i <- train_set |> group_by(movieId) |> summarize(n=n())
+mean(b_i$n) # 672
+median(b_i$n) # 97
+b_g <- train_set |> group_by(genres) |> summarize(n=n())
+mean(b_g$n) # 8999
+median(b_g$n) # 1168
+
+# Commenting this out so the script can be run without the tuning, which takes
+# a while.
+# tuning_grid <- crossing(
+#   lambda_u = c(50, 100, 150),
+#   lambda_m = c(100, 500, 1000),
+#   lambda_g = c(1000, 3000, 7000, 10000)
+# )
+# n <- nrow(tuning_grid)
+# cores <- min(detectCores() - 1, 15)
+# registerDoParallel(cores)
+# results <- foreach(
+#   i = 1:n,
+#   .packages = c("data.table"),
+#   .combine = c
+# ) %dopar% {
+#   tuning_grid_row <- tuning_grid[i, ]
+#   fit <- fit_als_with_known_effects(train_set, lambda_u = tuning_grid_row$lambda_u, lambda_m = tuning_grid_row$lambda_m, lambda_g = tuning_grid_row$lambda_g)
+#   mu <- fit$mu
+#   b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
+#   b_u <- setNames(fit$b_u$a, fit$b_u$userId)
+#   b_g <- setNames(fit$b_g$c, fit$b_g$genres)
+#   #
+#   resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres]))
+#   rmse(resid)
+# }
+# stopImplicitCluster()
+# tuning_grid[which.min(results),]
+
+# That gave me the values I used above: 50, 100, and 10000
 
 #######################################################
 # Step 6: Model with latent effects + tuning
 #######################################################
-
-# I know not just from the course textbook/videos but also from general domain
-# knowledge that there is more that goes into how people rate movies than is
-# captured in the table columns. My two sisters judge movies based on costuming
-# and whether the cinematography  is "pretty". I'll bail if the world-building
-# doesn't make sense. Looking for latent factors is the best way I have at getting
-# at that.
-
 fit_als_with_latent <- function(data = train_set,
-                                K = 5,        
-                                lambda_u = 0.00001,
-                                lambda_m = 0.00001,
-                                lambda_d = 0.01,
-                                lambda_g = 0.001,
-                                lambda_pq = 1e-6,
-                                min_ratings = 40,
-                                tol = 1e-8,
+                                K = 24,        
+                                lambda_u = 50,
+                                lambda_m = 100,
+                                lambda_g = 10000,
+                                lambda_pq = 5,
+                                tol = 1e-6,
                                 max_iter = 500) {
   
   # Copy the data so we can mutate it at will
-  fit <- as.data.table(copy(data))
+  dt <- as.data.table(copy(data))
   
   # Calculate some initial numbers
-  N <- nrow(fit)
-  mu <- mean(fit$rating)
+  N <- nrow(dt)
+  mu <- mean(dt$rating)
   
-  # Shorthand for easy reference
-  user_ids <- as.character(fit$userId)
-  movie_ids <- as.character(fit$movieId)
+  # Initialize the residuals and the various effects
+  dt[, resid := rating - mu]
+  b_i_dt <- b_u_dt <- b_g_dt <- b_d_dt <- NULL
+  prev_loss <- rmse(dt$resid)
   
-  # Index by user and movie.
-  user_index <- split(1:N, user_ids)
-  movie_index <- split(1:N, movie_ids)
-  unique_users <- unique(user_ids)
-  unique_movies <- unique(movie_ids)
-  
-  n_item <- sapply(movie_index, length)
-  min_ratings_index <- which(n_item >= min_ratings)
-  movie_index_min <- movie_index[min_ratings_index]
-  
-  movie_ids_by_length <- n_item[movie_ids]
-  min_data_index <- which(movie_ids_by_length >= min_ratings)
-  user_index_min <- split(min_data_index, user_ids[min_data_index])
-  
-  # Set initial user and movie effects of 0
-  fit$a <- rep(0, N)
-  fit$b <- rep(0, N)
-  fit$c <- rep(0, N)
-  fit$d <- rep(0, N)
-  
-  
-  # Next use singular value decomposition to find the latent user effects
-  # Adapted from the source code for fit_recommender_model in dslabs
-  # https://cran.r-project.org/web/packages/dslabs/index.html
-  I <- length(unique_users)
-  J <- length(unique_movies)
-  p <- svd(matrix(rnorm(K * I, 0, 0.1), I, K))$u
-  rownames(p) <- unique_users
-  q <- matrix(rep(0, K * J), J, K)
-  rownames(q) <- unique_movies
-  pq <- rep(0, N)
-  fit$pq <- pq
-  resid <- with(fit, rating - mu)
-  prev_loss <- mean(resid^2)
-  message(sprintf("Iteration 0: Loss = %.6f", 
-                  prev_loss))
-  
-  # Now use ALS to calculate the movie and user effects and the latent effects
+  # Now use ALS to calculate the move, user, and genre effects
+  # This is all the exact same as the previous function.
   for (iter in 1:max_iter) {
-    # Estimate the user effect, given a movie, genre, and decade effect, and update
-    # our user index
-    fit_users <- fit |> 
-      group_by(userId) |> 
-      summarize(a = sum(rating - mu - b - c - d - pq) / (n() + lambda_u * N), userId = first(userId)) |> 
-      select(userId, a)
-    fit <- rows_update(fit, fit_users, by = "userId")
-    rm(fit_users)
+    # Estimate the movie effect
+    b_i_dt <- dt[, .(b = sum(resid) / (.N + lambda_m)), by = movieId]
+    dt[b_i_dt, on = "movieId", bi := i.b]
+    dt[, resid := rating - mu - bi]
     
-    # Now estimate the movie effect, given a user, genre, and decade effect,
-    # and update our movie index
-    fit_movies <- fit |> 
-      group_by(movieId) |> 
-      summarize(b = sum(rating - mu - a - c - d - pq) / (n() + lambda_m * N), movieId = first(movieId)) |> 
-      select(movieId, b)
-    fit <- rows_update(fit, fit_movies, by = "movieId")
-    rm(fit_movies)
+    # Estimate the movie effect, given a user effect,
+    b_u_dt <- dt[, .(a = sum(resid) / (.N + lambda_u)), by = userId]
+    dt[b_u_dt, on = "userId", bu := i.a]
+    dt[, resid := rating - mu - bi - bu]
     
-    # Calculate genre effect
-    fit_genre <- fit |> 
-      group_by(genres) |> 
-      summarize(c = sum(rating - mu - a - b - d - pq) / (n() + lambda_g * N), genres = first(genres)) |> 
-      select(genres, c)
-    fit <- rows_update(fit, fit_genre, by = "genres")
-    rm(fit_genre)
+    # Estimate the genre effect, given a movie effect and user effect
+    b_g_dt <- dt[, .(c = sum(resid) / (.N + lambda_g)), by = genres]
+    dt[b_g_dt, on = "genres", bg := i.c]
+    dt[, resid := rating - mu - bi - bu - bg]
     
-    # Calculate decade effect
-    fit_decade <- fit |> 
-      group_by(decade) |> 
-      summarize(d = sum(rating - mu - a - b - c - pq) / (n() + lambda_d * N), decade = first(decade)) |>
-      select(decade, d)
-    fit <- rows_update(fit, fit_decade, by = "decade")
-    rm(fit_decade)
+    # Check for convergence
+    loss <- rmse(dt$resid)
+    delta <- abs(loss - prev_loss) / prev_loss
     
-    # Now calculate the initial pq
-    pq <- rowSums(p[user_ids, -1, drop = FALSE] * q[movie_ids, -1, drop = FALSE])
-    resid <- with(fit, rating - (mu + a + b + c + d + pq))
-    
-    prev_p <- p
-    prev_q <- q
-    
-    # For K latent factors, calculate the effect using ALS again
-    for (k in 1:K) {
-      q[min_ratings_index, k] <- sapply(movie_index_min, function(i) {
-        x <- p[user_ids[i], k]
-        sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
-      })
-      # Damping to prevent too much oscillation
-      q[, k] <- 0.7 * q[, k] + 0.3 * prev_q[, k]
-      
-      p[, k] <- sapply(user_index_min, function(i) {
-        x <- q[movie_ids[i], k]
-        sum(x*resid[i])/(sum(x^2) + lambda_pq * N)
-      })
-      p[, k] <- 0.7 * p[, k] + 0.3 * prev_p[, k]
-      
-      resid <- resid - p[user_ids, k]*q[movie_ids, k]
-    }
-    # Update pq now that we've calculated the effects
-    pq <- rowSums(p[user_ids, ] * q[movie_ids, ])
-    # Update our residuals
-    fit$pq <- pq
-    resid <- with(fit, rating - (mu + a + b + c + d + pq))
-    
-    # Check for convergence using Ridge regression/L2 regularization
-    # Loss function is modified to include the regularization term,
-    # so it's MSE + the sum of the co-efficient squared
-    b_u <- fit |> group_by(userId) |> summarize(a = first(a))
-    b_i <- fit |> group_by(movieId) |> summarize(b = first(b))
-    b_g <- fit |> group_by(genres) |> summarize(c = first(c))
-    b_d <- fit |> group_by(decade) |> summarize(d = first(d))
-    loss <- mean(resid^2) + (sum(b_u$a^2) * lambda_u) + (sum(b_i$b^2) * lambda_m) + (sum(b_g$c^2) * lambda_g) + (sum(b_d$d^2) * lambda_d) + ((sum(p^2) + sum(q^2)) * lambda_pq)
-    raw_mse <- mean(resid^2)
-    delta <- abs(prev_loss - loss) / (prev_loss + 1e-8)
-    message(sprintf("Iteration %d: Delta = %.6f, Loss = %.6f, Raw MSE = %.6f", 
-                    iter, delta, loss, raw_mse))
     # If the update is less than what we set as our tolerance, we're done!
     # Otherwise, it'll keep going until we hit max_iter iterations.
     # The second check is to prevent bad values from growing so exponentially 
@@ -451,42 +353,105 @@ fit_als_with_latent <- function(data = train_set,
     prev_loss <- loss
   }
   
-  # Create canonical form of orthogonal factors, ordered by importance
-  # "Orthogonal" = pointing in unrelated directions (at 90 degrees to one another)
-  # This helps prevent factors from being redundant and/or overlapping
+  # Now calculate the latent effects
+  prev_loss <- rmse(dt$resid)
   
-  # Taken from the source code for fit_recommender_model in dslabs
-  # https://cran.r-project.org/web/packages/dslabs/index.html
+  # Index by user and movie.
+  unique_users <- unique(dt$userId)
+  unique_movies <- unique(dt$movieId)
+  n_users  <- length(unique_users)
+  n_movies <- length(unique_movies)
   
-  # Computes the QR decomposition of p
-  QR_p <- qr(p)
-  # Computes the QR decomposition of q, including only movies with at least 20 ratings
-  QR_q <- qr(q[min_ratings_index,,drop = FALSE])
-  # Computes the SVD of the product of the two R matrices
-  # That way, we're multiplying KxK matrices instead of the much larger NxN matrices
-  s <- svd(qr.R(QR_p) %*% t(qr.R(QR_q)))
-  # Creates the new orthogonalized user factors
-  u <- qr.Q(QR_p) %*% s$u
-  # Same but for movies
-  v <- qr.Q(QR_q) %*% s$v
-  # Give our new factors the same rownames as the original p and q
-  rownames(u) <- rownames(p)
-  rownames(v) <- rownames(q[min_ratings_index,,drop = FALSE])
-  # Multiply all columns in u by the square root of s$d, which represents the importance/strength of the factor
-  # Using the square root keeps p and q on similar scales
-  p <- sweep(u, 2, sqrt(s$d), FUN = "*")
-  # Same multiplication for q
-  q[min_ratings_index,] <- sweep(v, 2, sqrt(s$d), FUN = "*")
-  # Now factors are ordered by importance -- the first column captures the most variance and so on
+  # Index by position in the unique_users/unique_movies lists
+  user_int  <- match(dt$userId, unique_users)
+  movie_int <- match(dt$movieId, unique_movies)
+  resids <- dt$resid
+  
+  # Pre-sort the data so maybe the code doesn't take 2 weeks to run this time.
+  # Sort by users for p (user latent factors)
+  order_by_user <- order(user_int)
+  users_by_userId <- user_int[order_by_user]
+  movies_by_userId <- movie_int[order_by_user]
+  resids_by_userId <- resids[order_by_user]
+  
+  # Sort by movies for q (movie latent factors)
+  order_by_movie <- order(movie_int)
+  users_by_movieId <- user_int[order_by_movie]
+  movies_by_movieId <- movie_int[order_by_movie]
+  resids_by_movieId <- resids[order_by_movie]
+  
+  # And now, a trick Claude Code told me about: use rle() to compress the indices
+  # into lengths and values, so we can easily find the starting and ending point
+  # for a user or movie's ratings. This again is aimed at speeding things up so
+  # the code does not take 2 weeks to run because omg I am not doing that again.
+  u_rle <- rle(users_by_userId)
+  user_endpoints <- cumsum(u_rle$lengths)
+  user_starting_points <- c(1L, user_endpoints[-length(user_endpoints)] + 1L)
+  m_rle <- rle(movies_by_movieId)
+  movie_endpoints <- cumsum(m_rle$lengths)
+  movie_starting_points <- c(1L, movie_endpoints[-length(movie_endpoints)] + 1L)
+  
+  # Initialize p and q
+  p <- matrix(rnorm(n_users  * K, mean = 0, sd = 0.01), nrow = n_users,  ncol = K)
+  q <- matrix(rnorm(n_movies * K, mean = 0, sd = 0.01), nrow = n_movies, ncol = K)
+  
+  # Calculate the diagonal and regularize it
+  lambda_pq_diag <- lambda_pq * diag(K)
+  
+  for (iter in 1:max_iter) {
+    # Do this in two loops, like we did above. First we calculate our p values,
+    # holding q constant.
+    for (i in 1:n_users) {
+      current_user <- user_starting_points[i]:user_endpoints[i]
+      # Get the latent factors (q) for every movie that the user has rated.
+      # For example, how good are the costumes for each?
+      q_i <- q[movies_by_userId[current_user], , drop = FALSE]
+      resids_i <- resids_by_userId[current_user]
+      # K x K matrix of movie factors, with the regularization penalty.
+      # Need this in order to figure out how movies are related to one another.
+      # If 18th-century novel adaptations always have good costumes, don't want
+      # to end up always counting the residual for both.
+      # Same as t(q_i) %*% q_i + lambda_pq_diag, but supposedly faster
+      qi_by_qi <- crossprod(q_i) + lambda_pq_diag
+      # Calculate how much each K factor correlates with the user's residuals
+      x <- crossprod(q_i, resids_i)
+      # Calculate and save the effect of the fixed movie effects on the user,
+      # for example, does the user rate higher movies in the "good costume" group?
+      p[u_rle$values[i], ] <- solve(qi_by_qi, x)
+    }
+    # Same as above, just for q values (movies).
+    for (j in 1:n_movies) {
+      current_movie <- movie_starting_points[j]:movie_endpoints[j]
+      p_j <- p[users_by_movieId[current_movie], , drop = FALSE]
+      resids_j <- resids_by_movieId[current_movie]
+      pj_by_pj <- crossprod(p_j) + lambda_pq_diag
+      x <- crossprod(p_j, resids_j)
+      q[m_rle$values[j], ] <- solve(pj_by_pj, x)
+    }
+    pq <- rowSums(p[user_int, , drop = FALSE] * q[movie_int, , drop = FALSE])
+    
+    # Check for convergence
+    loss <- rmse(resids - pq)
+    delta <- abs(loss - prev_loss) / prev_loss
+
+    # If the update is less than what we set as our tolerance, we're done!
+    # Otherwise, it'll keep going until we hit max_iter iterations.
+    # The second check is to prevent bad values from growing so exponentially 
+    # that we overload R
+    if (delta < tol | delta > 1e07)
+      break
+    prev_loss <- loss
+  }
   
   
   # Return the regularized effects
+  rownames(p) <- as.character(unique_users)
+  rownames(q) <- as.character(unique_movies)
   list(
     mu = mu,
-    b_u = b_u,
-    b_i = b_i,
-    b_g = b_g,
-    b_d = b_d,
+    b_i = as.data.frame(b_i_dt),
+    b_u = as.data.frame(b_u_dt),
+    b_g = as.data.frame(b_g_dt),
     p = p,
     q = q
   )
@@ -498,353 +463,23 @@ mu <- fit$mu
 b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
 b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-
+# 
 pq <- rowSums(fit$p[as.character(test_set$userId), ] * fit$q[as.character(test_set$movieId), ])
 test_set$pq <- pq
-resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
+resid <- with(test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + pq))
 with_latent <- rmse(resid)
+# At time of testing, 0.841691104747076
 
-# I did a lot of tuning and trial-and-error here, changing one of the params
-# and testing again with my test_set. The commit history at 
-# https://github.com/kmonahan/movie-ratings-capstone covers a lot of the journey.
-
-# Some of my tuning code. Leaving this commented out because you do NOT want to
-# run this. It takes way too long.
-
-# # Movie penalty (lambda_m)
-# folds <- createFolds(train_set$rating,
-#                      k = 10,
-#                      list = TRUE,
-#                      returnTrain = TRUE)
-# sets <- lapply(folds, function(fold) {
-#   train_set[-fold, ]
-# })
-# lambdas <- 10^-(3:6)
-# cores <- min(detectCores() - 1, 10)
-# registerDoParallel(cores)
-# results <- foreach(lambda = lambdas) %do% {
-#   validations <- foreach(
-#     set = sets,
-#     .packages = c("caret", "data.table", "tidyverse"),
-#     .verbose = TRUE,
-#     .combine = c
-#   ) %dopar% {
-#     set_index <- split(1:nrow(set), set$userId)
-#     # Assign 10% of each user's rating to the test set
-#     test_index <- sapply(set_index, function(ind)
-#       sample(ind, floor(length(ind) * .1))) |>
-#       unlist(use.names = TRUE) |> sort()
-#     mini_test_set <- set[test_index, ]
-#     mini_train_set <- set[-test_index, ]
-#     # Remove any movies that are not in BOTH the test and training sets
-#     mini_test_set <- mini_test_set |>
-#       semi_join(mini_train_set, by = "movieId")
-#     mini_train_set <- mini_train_set |>
-#       semi_join(mini_test_set, by = "movieId")
-#     
-#     fit <- fit_als_with_latent(
-#       mini_train_set,
-#       max_iter = 50,
-#       tol = 1e-4,
-#       lambda_m = lambda,
-#       min_ratings = 0
-#     )
-#     mu <- fit$mu
-#     b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-#     b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-#     b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-#     b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-#     pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
-#     mini_test_set$pq <- pq
-#     resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
-#     rmse(resid)
-#   }
-#   mean(validations)
-# }
-# stopImplicitCluster()
-# lambda_m <- 1e-05
-# 
-# # User penalty (lambda_u)
-# folds <- createFolds(train_set$rating,
-#                      k = 10,
-#                      list = TRUE,
-#                      returnTrain = TRUE)
-# sets <- lapply(folds, function(fold) {
-#   train_set[-fold, ]
-# })
-# lambdas <- 10^-(3:6)
-# cores <- min(detectCores() - 1, 10)
-# registerDoParallel(cores)
-# results <- foreach(lambda = lambdas) %do% {
-#   validations <- foreach(
-#     set = sets,
-#     .packages = c("caret", "data.table", "tidyverse"),
-#     .verbose = TRUE,
-#     .combine = c
-#   ) %dopar% {
-#     set_index <- split(1:nrow(set), set$userId)
-#     # Assign 10% of each user's rating to the test set
-#     test_index <- sapply(set_index, function(ind)
-#       sample(ind, floor(length(ind) * .1))) |>
-#       unlist(use.names = TRUE) |> sort()
-#     mini_test_set <- set[test_index, ]
-#     mini_train_set <- set[-test_index, ]
-#     # Remove any movies that are not in BOTH the test and training sets
-#     mini_test_set <- mini_test_set |>
-#       semi_join(mini_train_set, by = "movieId")
-#     mini_train_set <- mini_train_set |>
-#       semi_join(mini_test_set, by = "movieId")
-#     
-#     fit <- fit_als_with_latent(
-#       mini_train_set,
-#       max_iter = 50,
-#       tol = 1e-4,
-#       lambda_m = lambda_m,
-#       lambda_u = lambda,
-#       min_ratings = 0
-#     )
-#     mu <- fit$mu
-#     b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-#     b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-#     b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-#     b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-#     pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
-#     mini_test_set$pq <- pq
-#     resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
-#     rmse(resid)
-#   }
-#   mean(validations)
-# }
-# stopImplicitCluster()
-# lambda_u <- 1e-05
-# 
-# 
-# # Latent factors penalty (lambda_pq)
-# folds <- createFolds(train_set$rating,
-#                      k = 10,
-#                      list = TRUE,
-#                      returnTrain = TRUE)
-# sets <- lapply(folds, function(fold) {
-#   train_set[-fold, ]
-# })
-# lambdas <- 10^-(2:5)
-# cores <- min(detectCores() - 1, 10)
-# registerDoParallel(cores)
-# results <- foreach(lambda = lambdas, .combine = c) %do% {
-#   validations <- foreach(
-#     set = sets,
-#     .packages = c("caret", "data.table", "tidyverse"),
-#     .verbose = TRUE,
-#     .combine = c
-#   ) %dopar% {
-#     set_index <- split(1:nrow(set), set$userId)
-#     # Assign 10% of each user's rating to the test set
-#     test_index <- sapply(set_index, function(ind)
-#       sample(ind, floor(length(ind) * .1))) |>
-#       unlist(use.names = TRUE) |> sort()
-#     mini_test_set <- set[test_index, ]
-#     mini_train_set <- set[-test_index, ]
-#     # Remove any movies that are not in BOTH the test and training sets
-#     mini_test_set <- mini_test_set |>
-#       semi_join(mini_train_set, by = "movieId")
-#     mini_train_set <- mini_train_set |>
-#       semi_join(mini_test_set, by = "movieId")
-#     
-#     fit <- fit_als_with_latent(
-#       mini_train_set,
-#       max_iter = 50,
-#       tol = 1e-4,
-#       lambda_m = lambda_m,
-#       lambda_u = lambda_u,
-#       lambda_pq = lambda,
-#       K = 8,
-#       min_ratings = 0
-#     )
-#     mu <- fit$mu
-#     b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-#     b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-#     b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-#     b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-#     pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
-#     mini_test_set$pq <- pq
-#     resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
-#     rmse(resid)
-#   }
-#   mean(validations)
-# }
-# stopImplicitCluster()
-# lambda_pq <- 0.001
-# 
-# # Min Ratings
-# # We need a larger data set here, so let's see how it does if we treat the
-# # train_set as the entire set
-# min_ratings <- c(5, 10, 20, 40)
-# set_index <- split(1:nrow(train_set), train_set$userId)
-# # Assign 10% of each user's rating to the test set
-# test_index <- sapply(set_index, function(ind)
-#   sample(ind, floor(length(ind) * .1))) |>
-#   unlist(use.names = TRUE) |> sort()
-# mini_test_set <- train_set[test_index, ]
-# mini_train_set <- train_set[-test_index, ]
-# # Remove any movies that are not in BOTH the test and training sets
-# mini_test_set <- mini_test_set |>
-#   semi_join(mini_train_set, by = "movieId")
-# mini_train_set <- mini_train_set |>
-#   semi_join(mini_test_set, by = "movieId")
-# 
-# cores <- min(detectCores() - 1, 10)
-# registerDoParallel(cores)
-# results <- foreach(
-#   min_rating = min_ratings,
-#   .combine = c,
-#   .packages = c("caret", "data.table", "tidyverse"),
-#   .verbose = TRUE
-# ) %dopar% {
-#   fit <- fit_als_with_latent(
-#     mini_train_set,
-#     max_iter = 50,
-#     tol = 1e-4,
-#     min_ratings = min_rating
-#   )
-#   mu <- fit$mu
-#   b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-#   b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-#   b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-#   b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-#   pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
-#   mini_test_set$pq <- pq
-#   resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
-#   rmse(resid)
-# }
-# stopImplicitCluster()
-# # Same result regardless of min ratings??
-# # Maybe we don't need a minimum then.
-# # Will use the larger value for now, since maybe that'll speed things up.
-# # It's also possible that with this large of a data set, there are no movies
-# # with few enough ratings to fall below the min anyway.
-# min_rating <- 40
-# 
-# # Now that we've got the general range for our values, let's do a final grid search.
-# # Trying to use the full data set with 5-fold validation took so long that I called quits
-# # after 33 hours. So let's get a smaller data sample.
-# 
-# lambda_m_vals <- c(1e-05, 3e-05, 5e-05)
-# lambda_u_vals <- c(1e-05, 3e-05, 5e-05)
-# lambda_pq_vals <- c(1e-03, 1e-04, 1e-05)
-# lambda_d_vals <- c(0.01, 0.001, 0.0001)
-# lambda_g_vals <- c(0.001, 0.0001)
-# k_vals <- c(5, 7, 9)
-# 
-# # Start with users who have rated at least 100 movies and movies rated by those
-# # users at least 5 times
-# filtered_train_set <- train_set |> 
-#   group_by(userId) |>
-#   filter(n() >= 100) |>
-#   ungroup() |>
-#   group_by(movieId) |> 
-#   filter(n() >= 5) |>
-#   ungroup()
-# 
-# # Randomly choose 100,000 ratings from that group
-# one_hundred_k_set <- sample_n(filtered_train_set, 100000)
-# 
-# samples <- createResample(
-#   one_hundred_k_set$rating,
-#   times = 5,
-#   list = TRUE
-# )
-# sets <- lapply(samples, function(sample) {
-#   one_hundred_k_set[-sample, ]
-# })
-# 
-# # Measuring with proc.time, the smaller sample takes 239 seconds to test one
-# # row. So even if running tests in parallel doesn't speed anything up (though it
-# # should), testing all 81 rows would be 19359 seconds or 5-6 hours. Which is a
-# # long time, but better than me giving up after 33. So let's give it a go!
-# 
-# # Much better! Under 2 hours!
-# 
-# tuning_grid <- crossing(
-#   lambda_m = lambda_m_vals,
-#   lambda_pq = lambda_pq_vals,
-#   lambda_d = lambda_d_vals,
-#   K = k_vals
-# )
-# n <- nrow(tuning_grid)
-# cores <- min(detectCores() - 1, 15)
-# registerDoParallel(cores)
-# 
-# 
-# results <- foreach(
-#   i = 1:n,
-#   .packages = c("caret", "data.table", "tidyverse", "foreach"),
-#   .combine = c
-# ) %dopar% {
-#   tuning_grid_row <- tuning_grid[i, ]
-#   validations <- foreach(set = sets,
-#                          .verbose = TRUE,
-#                          .combine = c) %do% {
-#                            set_index <- split(1:nrow(set), set$userId)
-#                            # Assign 20% of each user's rating to the test set
-#                            test_index <- sapply(set_index, function(ind)
-#                              sample(ind, floor(length(ind) * .2))) |>
-#                              unlist(use.names = TRUE) |> sort()
-#                            mini_test_set <- set[test_index, ]
-#                            mini_train_set <- set[-test_index, ]
-#                            # Remove any movies that are not in BOTH the test and training sets
-#                            mini_test_set <- mini_test_set |>
-#                              semi_join(mini_train_set, by = "movieId")
-#                            mini_train_set <- mini_train_set |>
-#                              semi_join(mini_test_set, by = "movieId")
-#                            # Remove any users that are now only in the test set
-#                            mini_test_set <- mini_test_set |>
-#                              semi_join(mini_train_set, by = "userId")
-#                            
-#                            fit <- fit_als_with_latent(
-#                              mini_train_set,
-#                              max_iter = 25,
-#                              tol = 1e-4,
-#                              lambda_m = tuning_grid_row$lambda_m,
-#                              lambda_u = tuning_grid_row$lambda_m,
-#                              lambda_pq = tuning_grid_row$lambda_pq,
-#                              lambda_d = tuning_grid_row$lambda_d,
-#                              lambda_g = tuning_grid_row$lambda_d,
-#                              K = tuning_grid_row$K,
-#                              min_ratings = 0
-#                            )
-#                            mu <- fit$mu
-#                            b_u <- setNames(fit$b_u$a, fit$b_u$userId)
-#                            b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
-#                            b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-#                            b_d <- setNames(fit$b_d$d, fit$b_d$decade)
-#                            pq <- rowSums(fit$p[as.character(mini_test_set$userId), ] * fit$q[as.character(mini_test_set$movieId), ])
-#                            mini_test_set$pq <- pq
-#                            resid <- with(mini_test_set, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[as.character(genres)] + b_d[as.character(decade)] + pq))
-#                            rmse(resid)
-#                          }
-#   mean(validations)
-# }
-# stopImplicitCluster()
-# 
-# tuning_grid[which.min(results),]
-
-# When I plugged the tuning_grid results into my function, I found that they
-# weren't quite right and I had to go back to some of the results from my previous
-# tests. (And the lambda_pq ended up being WAY off, which I didn't realize until
-# I compared the calculations with my non-latent-effects model). I suspect this
-# is because I reduced my sample size too much in an attempt to not have the code
-# run for multiple days. Given a much smaller N, the smaller lambda values likely
-# resulted in no regularization at all.
-
-# At this point, I did a lot of iterations of re-running the same code with a
-# value tweaked, often stopping after 8 or so iterations if it was clear we were
-# heading in the wrong direction. (It didn't help that there were bugs in my
-# code that I found along the way). Eventually, I landed on lambda values that
-# worked decently when tested on my test set, using the un-commented out code
-# above.
+# Instead of running multiple tuning attempts in parallel, I ran them sequentially,
+# testing values in order: 0.5, 0.25, 1, 2.5
+# Had I know it was going to take 4 attempts, I should have done them in parallel,
+# but c'est la vie. 
 
 ########################################################
 # Step 7: Clean and test the final holdout data
 ########################################################
 final_holdout_test <- prep_data_columns(final_holdout_test)
+pq <- rowSums(fit$p[as.character(final_holdout_test$userId), ] * fit$q[as.character(final_holdout_test$movieId), ])
+final_holdout_test$pq <- pq
+resid <- with(final_holdout_test, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + pq))
+rmse(resid) # 0.842095

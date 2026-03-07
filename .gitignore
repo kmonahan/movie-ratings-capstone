@@ -51,5 +51,10 @@ rsconnect/
 
 # Large data files
 *.zip
-rdas/
+rdas/*
 ml-10M100K/
+
+# Include files needed for .Rmd report
+!/rdas/train_set_clean.RData
+!/rdas/test_set_clean.RData
+!/rdas/final_holdout_test_clean.RData
