@@ -18,9 +18,8 @@ mu <- fit$mu
 b_u <- setNames(fit$b_u$a, fit$b_u$userId)
 b_i <- setNames(fit$b_i$b, fit$b_i$movieId)
 b_g <- setNames(fit$b_g$c, fit$b_g$genres)
-b_d <- setNames(fit$b_d$d, fit$b_d$decade)
 
 pq <- rowSums(fit$p[as.character(final_holdout_test$userId), ] * fit$q[as.character(final_holdout_test$movieId), ])
 final_holdout_test$pq <- pq
-resid <- with(final_holdout_test, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + b_d[as.character(decade)] + pq))
+resid <- with(final_holdout_test, rating - clamp(mu + b_i[as.character(movieId)] + b_u[as.character(userId)] + b_g[genres] + pq))
 rmse(resid)
